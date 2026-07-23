@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { AUTH_FILE, ensureDataDir, type AppConfig } from '../config.js';
 import { logger } from '../logger.js';
 
@@ -11,6 +11,17 @@ export interface AuthState {
   copilotExpiresAt?: number;
   /** endpoints.api from the Copilot token response. */
   copilotApiBase?: string;
+  /**
+   * Reason of the last failed Copilot token refresh (e.g. access_token revoked).
+   * Cleared on any successful refresh. Consumed by {@link isAuthValid} and
+   * `copilot-relay status` (spec §1.3 / §11.1).
+   */
+  lastRefreshError?: string;
+}
+
+export interface EnsureOptions {
+  /** True to bypass the 5 min expiry margin and force an upstream refresh. */
+  force?: boolean;
 }
 
 const COPILOT_TOKEN_URL = 'https://api.github.com/copilot_internal/v2/token';
@@ -32,8 +43,18 @@ export function saveAuth(state: AuthState): void {
   try {
     chmodSync(AUTH_FILE, 0o600);
   } catch {
-    /* Windows ACLs make chmod largely a no-op; ignore. */
+    /* Windows ACLs make chmod largely a no-op; ignore (spec §3). */
   }
+}
+
+export function clearAuth(): void {
+  if (existsSync(AUTH_FILE)) unlinkSync(AUTH_FILE);
+}
+
+/** Spec §11.1: state exists, accessToken present, last refresh did not fail. */
+export function isAuthValid(state: AuthState | null): boolean {
+  if (!state || !state.accessToken) return false;
+  return !state.lastRefreshError;
 }
 
 export function isCopilotTokenValid(state: AuthState): boolean {
@@ -57,9 +78,11 @@ export async function refreshCopilotToken(
     },
   });
   if (!res.ok) {
-    throw new Error(
-      `Copilot token exchange failed: ${res.status} ${await res.text()}`,
-    );
+    // Persist the failure marker but do NOT overwrite the copilot token fields
+    // (spec §11.1: refreshed fields not overwritten on failure).
+    const reason = `Copilot token exchange failed: ${res.status} ${await res.text()}`;
+    saveAuth({ ...state, lastRefreshError: reason });
+    throw new Error(reason);
   }
   const data = (await res.json()) as {
     token: string;
@@ -72,14 +95,25 @@ export async function refreshCopilotToken(
     copilotExpiresAt: data.expires_at,
     copilotApiBase:
       data.endpoints?.api ?? state.copilotApiBase ?? 'https://api.githubcopilot.com',
+    lastRefreshError: undefined,
   };
   saveAuth(next);
   return next;
 }
 
-export async function ensureCopilotToken(cfg: AppConfig): Promise<AuthState> {
+/**
+ * Return a usable AuthState for calling Copilot API.
+ *
+ * @param opts.force  When true, skip the 5 min cache check and always refresh
+ *                    (spec §11.1). Used by the reactive 401 retry path in
+ *                    spec §2.7.
+ */
+export async function ensureCopilotToken(
+  cfg: AppConfig,
+  opts?: EnsureOptions,
+): Promise<AuthState> {
   const state = loadAuth();
   if (!state) throw new Error('Not logged in. Run `copilot-relay login` first.');
-  if (isCopilotTokenValid(state)) return state;
+  if (!opts?.force && isCopilotTokenValid(state)) return state;
   return refreshCopilotToken(state, cfg);
 }
