@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.log
 *.tsbuildinfo
+
+# Local overrides for .npmrc (e.g. auth tokens); the tracked .npmrc holds
+# only the registry URL — never commit secrets.
+.npmrc.local

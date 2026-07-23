@@ -225,7 +225,14 @@ async function callUpstream(
 ): Promise<Response> {
   const { url, headers } = translator.buildUpstreamRequest(req, cfg, auth);
   logger.debug(`-> ${url}`);
-  return await fetch(url, { method: 'POST', headers, body, signal });
+  // Upstream bodies are always JSON per spec §2.3/§2.4; pass as UTF-8 string
+  // to satisfy fetch's BodyInit typing without a raw type cast.
+  return await fetch(url, {
+    method: 'POST',
+    headers,
+    body: body.toString('utf8'),
+    signal,
+  });
 }
 
 function respondError(
