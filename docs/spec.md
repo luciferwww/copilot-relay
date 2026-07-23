@@ -222,6 +222,8 @@ interface AuthState {
   copilotToken?: string;       // 短期 Copilot token
   copilotExpiresAt?: number;   // epoch 秒
   copilotApiBase?: string;     // e.g. "https://api.githubcopilot.com"
+  lastRefreshError?: string;   // 上次换 Copilot token 失败原因;成功时清空。
+                               // 供 §11.1 isAuthValid / §1.3 status 使用。
 }
 ```
 
