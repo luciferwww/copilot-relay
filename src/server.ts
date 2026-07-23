@@ -59,27 +59,31 @@ async function handleRequest(
   res: http.ServerResponse,
   cfg: AppConfig,
 ): Promise<void> {
-  const url = req.url ?? '/';
+  const rawUrl = req.url ?? '/';
   const method = req.method ?? 'GET';
-  logger.debug(`${method} ${url}`);
+  // Route on the path only; query strings and hashes are transport-level
+  // metadata that should not affect dispatch (e.g. Claude Code sends
+  // /v1/messages?beta=true).
+  const path = rawUrl.split('?')[0].split('#')[0];
+  logger.debug(`${method} ${rawUrl}`);
 
-  if (method === 'GET' && url === '/health') {
+  if (method === 'GET' && path === '/health') {
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ ok: true }));
     return;
   }
 
-  if (method === 'GET' && url === '/v1/models') {
+  if (method === 'GET' && path === '/v1/models') {
     await proxyModels(req, res, cfg);
     return;
   }
 
-  if (method === 'POST' && (url === '/v1/chat/completions' || url === '/chat/completions')) {
+  if (method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {
     await proxy(req, res, cfg, openaiTr);
     return;
   }
 
-  if (method === 'POST' && url === '/v1/messages') {
+  if (method === 'POST' && path === '/v1/messages') {
     await proxy(req, res, cfg, anthropicTr);
     return;
   }
@@ -87,7 +91,7 @@ async function handleRequest(
   // Spec §2.5 — simplified OpenAI shape for unmatched routes.
   res.statusCode = 404;
   res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify({ error: { message: `No route for ${method} ${url}` } }));
+  res.end(JSON.stringify({ error: { message: `No route for ${method} ${rawUrl}` } }));
 }
 
 async function proxy(

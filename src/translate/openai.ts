@@ -14,7 +14,8 @@ export function buildUpstreamRequest(
   auth: AuthState,
 ): UpstreamRequest {
   const base = auth.copilotApiBase ?? 'https://api.githubcopilot.com';
-  const url = `${base}/chat/completions`;
+  const qs = extractQueryString(inbound.url);
+  const url = `${base}/chat/completions${qs}`;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${auth.copilotToken ?? ''}`,
@@ -60,4 +61,15 @@ export function writeStreamErrorFrame(
   };
   res.write(`data: ${JSON.stringify(body)}\n\n`);
   res.end();
+}
+
+/**
+ * Extract the `?...` portion (including the leading `?`) from an inbound URL,
+ * or empty string if there isn't one. Preserves query params (e.g. api-version)
+ * that upstream may act on.
+ */
+function extractQueryString(inbound: string | undefined): string {
+  if (!inbound) return '';
+  const q = inbound.indexOf('?');
+  return q >= 0 ? inbound.slice(q) : '';
 }
