@@ -70,18 +70,7 @@ async function handleRequest(
   }
 
   if (method === 'GET' && url === '/v1/models') {
-    res.setHeader('content-type', 'application/json');
-    res.end(
-      JSON.stringify({
-        object: 'list',
-        data: [
-          { id: 'gpt-4o', object: 'model', owned_by: 'github-copilot' },
-          { id: 'gpt-4o-mini', object: 'model', owned_by: 'github-copilot' },
-          { id: 'claude-3.5-sonnet', object: 'model', owned_by: 'github-copilot' },
-          { id: 'claude-sonnet-4', object: 'model', owned_by: 'github-copilot' },
-        ],
-      }),
-    );
+    await proxyModels(req, res, cfg);
     return;
   }
 
@@ -233,6 +222,126 @@ async function callUpstream(
     body: body.toString('utf8'),
     signal,
   });
+}
+
+/**
+ * Spec §2.2 — GET /v1/models proxies upstream and never invents its own list.
+ * Uses OpenAI-shape error responses (spec §2.6). Non-streaming, but reuses the
+ * same 401 retry (spec §2.7) and client-abort (spec §2.9) contracts as proxy().
+ */
+async function proxyModels(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  cfg: AppConfig,
+): Promise<void> {
+  const abort = new AbortController();
+  const onClose = (): void => {
+    if (!res.writableEnded) {
+      logger.debug('Client disconnected; aborting upstream /models.');
+      abort.abort();
+    }
+  };
+  req.on('close', onClose);
+
+  try {
+    let auth: AuthState;
+    try {
+      auth = await ensureCopilotToken(cfg);
+    } catch (err) {
+      const status = isAuthValid(loadAuth()) ? 502 : 401;
+      respondError(
+        res,
+        openaiTr,
+        status,
+        'authentication_error',
+        (err as Error)?.message ?? 'authentication failure',
+      );
+      return;
+    }
+
+    let upstream = await callModelsUpstream(cfg, auth, abort.signal);
+
+    if (upstream.status === 401 && !res.headersSent) {
+      logger.info('Upstream 401 on /models; forcing token refresh and retrying once.');
+      try {
+        auth = await ensureCopilotToken(cfg, { force: true });
+      } catch (err) {
+        respondError(
+          res,
+          openaiTr,
+          401,
+          'authentication_error',
+          (err as Error)?.message ?? 'token refresh failed',
+        );
+        return;
+      }
+      upstream = await callModelsUpstream(cfg, auth, abort.signal);
+    }
+
+    if (!upstream.ok) {
+      const bodyText = await upstream.text();
+      const errClass = classifyStatus(upstream.status);
+      const msg =
+        pickUpstreamMessage(bodyText) ??
+        `Upstream ${upstream.status}${upstream.statusText ? ' ' + upstream.statusText : ''}`;
+      respondError(res, openaiTr, upstream.status, errClass, msg);
+      if (upstream.status === 401) {
+        logger.warn('Upstream 401 after refresh; please re-run `copilot-relay login`.');
+      }
+      return;
+    }
+
+    res.statusCode = upstream.status;
+    copyResponseHeaders(res, upstream);
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+    const nodeStream = Readable.fromWeb(
+      upstream.body as unknown as import('node:stream/web').ReadableStream,
+    );
+    nodeStream.on('error', (streamErr) => {
+      logger.warn('Upstream /models stream error:', streamErr);
+      if (!res.writableEnded) res.end();
+    });
+    nodeStream.pipe(res);
+  } catch (err) {
+    if (abort.signal.aborted) return;
+    logger.error('Proxy /models error:', err);
+    if (!res.headersSent) {
+      respondError(
+        res,
+        openaiTr,
+        502,
+        'api_error',
+        (err as Error)?.message ?? 'proxy error',
+      );
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  } finally {
+    req.off('close', onClose);
+  }
+}
+
+async function callModelsUpstream(
+  cfg: AppConfig,
+  auth: AuthState,
+  signal: AbortSignal,
+): Promise<Response> {
+  const base = auth.copilotApiBase ?? 'https://api.githubcopilot.com';
+  const url = `${base}/models`;
+  // Per spec §7.2 minus Content-Type (GET has no body).
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${auth.copilotToken ?? ''}`,
+    Accept: 'application/json',
+    'User-Agent': cfg.userAgent,
+    'Editor-Version': cfg.editorVersion,
+    'Editor-Plugin-Version': cfg.editorPluginVersion,
+    'Copilot-Integration-Id': cfg.copilotIntegrationId,
+  };
+  logger.debug(`-> GET ${url}`);
+  return await fetch(url, { method: 'GET', headers, signal });
 }
 
 function respondError(
