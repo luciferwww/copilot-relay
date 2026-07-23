@@ -6,7 +6,13 @@ import { Command } from 'commander';
 import { AUTH_FILE, CONFIG_FILE, PID_FILE, loadConfig, saveConfigDefaults } from './config.js';
 import { logger, setLevel, type LogLevel } from './logger.js';
 import { loginWithDeviceCode } from './auth/deviceCode.js';
-import { loadAuth, refreshCopilotToken, saveAuth } from './auth/copilot.js';
+import {
+  clearAuth,
+  isAuthValid,
+  loadAuth,
+  refreshCopilotToken,
+  saveAuth,
+} from './auth/copilot.js';
 import { startServer } from './server.js';
 
 const program = new Command();
@@ -28,6 +34,34 @@ program
     if (!loadAuth()) {
       logger.error('Not logged in. Run `copilot-relay login` first.');
       process.exit(1);
+    }
+    // Spec §6 — existing pid file: exit if the process is alive; overwrite
+    // (with a warning) if it is stale.
+    if (existsSync(PID_FILE)) {
+      const existing = parseInt(readFileSync(PID_FILE, 'utf8'), 10);
+      if (Number.isFinite(existing)) {
+        try {
+          process.kill(existing, 0);
+          console.log(
+            `Another copilot-relay instance appears to be running (pid=${existing}). ` +
+              'Use "copilot-relay stop" first.',
+          );
+          process.exit(1);
+        } catch (e) {
+          const code = (e as { code?: string }).code;
+          if (code === 'ESRCH') {
+            logger.warn(`Stale pid file (pid=${existing} not alive); overwriting.`);
+          } else {
+            console.log(
+              `Cannot verify pid ${existing} (${code ?? (e as Error).message}); ` +
+                'refusing to overwrite. Remove the pid file manually if you are sure.',
+            );
+            process.exit(1);
+          }
+        }
+      } else {
+        logger.warn('Existing pid file is not a number; overwriting.');
+      }
     }
     writeFileSync(PID_FILE, String(process.pid), 'utf8');
     const handle = await startServer(cfg);
@@ -91,7 +125,7 @@ program
   .description('Remove stored credentials.')
   .action(() => {
     if (existsSync(AUTH_FILE)) {
-      unlinkSync(AUTH_FILE);
+      clearAuth();
       logger.info('Removed auth file.');
     } else {
       logger.info('No auth file.');
@@ -122,12 +156,21 @@ program
       console.log('  copilot token: none (will be fetched on first request)');
     }
     console.log('  copilot api base: ' + (auth.copilotApiBase ?? '(default)'));
+    // Spec §1.3 — auth valid line derived from isAuthValid + lastRefreshError.
+    if (isAuthValid(auth)) {
+      console.log('  auth valid: yes');
+    } else {
+      const reason = auth.lastRefreshError ?? 'access_token missing, please re-login';
+      console.log('  auth valid: no – ' + reason);
+    }
   });
 
 program
   .command('config-show')
   .description('Print the resolved config (creating the file if missing).')
   .action(() => {
+    // Spec §1.6 — force logger to error so stdout stays pipe-friendly for `| jq`.
+    setLevel('error');
     const cfg = loadConfig();
     saveConfigDefaults();
     console.log('Config file: ' + CONFIG_FILE);
