@@ -355,18 +355,18 @@ function isAuthValid(state: AuthState | null): boolean;
 
 ```typescript
 const DATA_DIR: string;      // ~/.copilot-relay
-const CONFIG_PATH: string;   // <DATA_DIR>/config.json
-const AUTH_PATH: string;     // <DATA_DIR>/auth.json
-const PID_PATH: string;      // <DATA_DIR>/server.pid
+const CONFIG_FILE: string;   // <DATA_DIR>/config.json
+const AUTH_FILE: string;     // <DATA_DIR>/auth.json
+const PID_FILE: string;      // <DATA_DIR>/server.pid
 const DEFAULT_CONFIG: AppConfig;
 
 function loadConfig(): AppConfig;
 function saveConfigDefaults(): void;
 ```
 
-- `loadConfig`:读 `CONFIG_PATH`;缺失字段合并 `DEFAULT_CONFIG`(§5);
+- `loadConfig`:读 `CONFIG_FILE`;缺失字段合并 `DEFAULT_CONFIG`(§5);
   非法 JSON 视为空,不抛。
-- `saveConfigDefaults`:若 `CONFIG_PATH` 不存在则以 `DEFAULT_CONFIG` 创建
+- `saveConfigDefaults`:若 `CONFIG_FILE` 不存在则以 `DEFAULT_CONFIG` 创建
   (供 §1.6 `config-show` 使用)。
 
 ### 11.3 `server.ts`
