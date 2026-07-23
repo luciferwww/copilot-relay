@@ -4,17 +4,75 @@ Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible**
 
 > Status: v0.1 skeleton. Copilot backend only. Codex configuration is a stub.
 
-## Quick start
+## Prerequisites
+
+- **Node.js ≥ 18** (native `fetch` and `Readable.fromWeb` are required).
+- **Git** for cloning.
+- **Microsoft-internal note**: this repo ships an [.npmrc](.npmrc) pointing at
+  `https://packagefeedproxy.microsoft.io/npm/` so `npm install` works from the
+  corporate network. External users can delete the file or replace it with a
+  registry they have access to (e.g. the public `https://registry.npmjs.org/`).
+
+## Install
 
 ```powershell
+git clone <this-repo> c:\dev\copilot-relay
 cd c:\dev\copilot-relay
 npm install
 npm run build
-node .\dist\cli.js login          # GitHub device-code login
-node .\dist\cli.js start          # start proxy on http://127.0.0.1:5000
+npm link          # exposes `copilot-relay` as a global command
 ```
 
-Or after `npm link`, use the `copilot-relay` command directly.
+`npm link` creates a symlink to `dist/cli.js`, so subsequent `npm run build`
+rebuilds are picked up automatically — no re-link needed.
+
+### Alternative: run without `npm link`
+
+If you prefer not to install a global command, invoke the built entry point
+directly (works from any directory):
+
+```powershell
+node c:\dev\copilot-relay\dist\cli.js <subcommand>
+```
+
+## First-time setup
+
+```powershell
+copilot-relay login                     # GitHub device-code flow
+copilot-relay status                    # verify `auth valid: yes`
+copilot-relay start                     # foreground; defaults to port 5000
+```
+
+Then in another terminal, point your client at the proxy. For Claude Code:
+
+```powershell
+copilot-relay configure claude          # writes ~/.claude/settings.json
+```
+
+Fire up `claude` and it will route through the proxy to your Copilot
+subscription. The proxy prints a request log line per hit at `--log-level debug`.
+
+### Changing the port
+
+The default port is `5000`. If something else is already using it, pass
+`--port` on both `start` and `configure claude`:
+
+```powershell
+copilot-relay start --port 5001
+copilot-relay configure claude --port 5001
+```
+
+Or set it once in `~/.copilot-relay/config.json` so every future run picks it
+up (see [Config file](#config-file) below).
+
+## Update / uninstall
+
+```powershell
+git pull
+npm run build          # link stays valid — symlink follows the new dist/
+
+npm unlink -g copilot-relay   # remove the global command when you're done
+```
 
 ## Commands
 
