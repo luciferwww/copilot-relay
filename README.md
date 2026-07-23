@@ -35,7 +35,7 @@ Or after `npm link`, use the `copilot-relay` command directly.
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
 | `POST /v1/messages` | Anthropic messages API |
-| `GET  /v1/models` | Hard-coded model list |
+| `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
 
 ## Config file

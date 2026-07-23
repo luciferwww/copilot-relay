@@ -75,7 +75,7 @@ OpenAI / Anthropic API 的第三方 agent 都能通过用户自己的 GitHub Cop
 |---|---|
 | `POST /v1/chat/completions` (OpenAI, 支持流式) | ✅ |
 | `POST /v1/messages` (Anthropic, 支持流式) | ✅ |
-| `GET  /v1/models` (硬编码列表,不回源) | ✅ |
+| `GET  /v1/models` (透传上游) | ✅ |
 | `GET  /health` | ✅ |
 
 ### FR3. 认证

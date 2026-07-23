@@ -97,22 +97,18 @@
 
 ### 2.2 `GET /v1/models`
 
-- Response: `200 application/json`,body:
-  ```json
-  {
-    "object": "list",
-    "data": [
-      { "id": "gpt-4o",             "object": "model", "owned_by": "github-copilot" },
-      { "id": "gpt-4o-mini",        "object": "model", "owned_by": "github-copilot" },
-      { "id": "claude-3.5-sonnet",  "object": "model", "owned_by": "github-copilot" },
-      { "id": "claude-sonnet-4",    "object": "model", "owned_by": "github-copilot" }
-    ]
-  }
-  ```
-- 列表**硬编码**,不代表 Copilot 实际支持,仅供客户端探测。
+- 请求透传给 `GET <copilotApiBase>/models`,使用 §7.2 表格中除 `Content-Type`
+  之外的头(GET 无 body)。
+- 上游 2xx:body 原样透传给客户端(shape 由 Copilot 决定,通常为
+  `{ "object": "list", "data": [...] }`)。
+- 上游非 2xx / 上游 401:按 §2.6 / §2.7 处理(错误 shape 走 OpenAI 分类,
+  上游 401 触发一次强制刷新 + 重试)。
+- 客户端断开:按 §2.9 abort 上游。
 
 > [!NOTE]
-> 这 4 个 id 是探测性占位。真跑通首次请求后,请把 Copilot 后端**实际接受**的 model slug 回写到本节和 [src/server.ts](../src/server.ts) 中 `/v1/models` 的返回值,保持文档与代码一致。
+> v0.1 之前的实现返回一个硬编码 4-项列表,导致客户端在选择器里看到假可用的
+> model(如 `claude-3.5-sonnet`),真正 `POST /v1/chat/completions` 时被上游
+> 拒绝。改为透传后,列表与订阅端点(个人 / 企业)完全同步,不再需要人工回填。
 
 ### 2.3 `POST /v1/chat/completions` (亦接受 `POST /chat/completions`)
 
