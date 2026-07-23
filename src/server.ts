@@ -2,8 +2,8 @@ import http from 'node:http';
 import { Readable } from 'node:stream';
 import type { AppConfig } from './config.js';
 import { ensureCopilotToken } from './auth/copilot.js';
-import { buildOpenAiForward } from './translate/openai.js';
-import { buildAnthropicForward } from './translate/anthropic.js';
+import * as openaiTr from './translate/openai.js';
+import * as anthropicTr from './translate/anthropic.js';
 import { logger } from './logger.js';
 
 export interface ServerHandle {
@@ -90,11 +90,8 @@ async function proxy(
 ): Promise<void> {
   const body = await readBody(req);
   const auth = await ensureCopilotToken(cfg);
-  const reqHeaders = normalizeHeaders(req.headers);
-  const { url, headers } =
-    kind === 'openai'
-      ? buildOpenAiForward(auth, cfg, reqHeaders)
-      : buildAnthropicForward(auth, cfg, reqHeaders);
+  const translator = kind === 'openai' ? openaiTr : anthropicTr;
+  const { url, headers } = translator.buildUpstreamRequest(req, cfg, auth);
 
   logger.debug(`-> ${url}`);
   const upstream = await fetch(url, { method: 'POST', headers, body });
@@ -130,13 +127,4 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
-}
-
-function normalizeHeaders(h: http.IncomingHttpHeaders): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(h)) {
-    if (v === undefined) continue;
-    out[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : v;
-  }
-  return out;
 }
