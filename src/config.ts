@@ -46,7 +46,8 @@ export function loadConfig(): AppConfig {
   }
 }
 
-export function saveConfig(cfg: AppConfig): void {
+export function saveConfigDefaults(): void {
   ensureDataDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  if (existsSync(CONFIG_FILE)) return;
+  writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf8');
 }

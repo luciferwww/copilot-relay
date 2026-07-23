@@ -3,7 +3,7 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from '
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { Command } from 'commander';
-import { AUTH_FILE, CONFIG_FILE, PID_FILE, loadConfig, saveConfig } from './config.js';
+import { AUTH_FILE, CONFIG_FILE, PID_FILE, loadConfig, saveConfigDefaults } from './config.js';
 import { logger, setLevel, type LogLevel } from './logger.js';
 import { loginWithDeviceCode } from './auth/deviceCode.js';
 import { loadAuth, refreshCopilotToken, saveAuth } from './auth/copilot.js';
@@ -129,7 +129,7 @@ program
   .description('Print the resolved config (creating the file if missing).')
   .action(() => {
     const cfg = loadConfig();
-    saveConfig(cfg);
+    saveConfigDefaults();
     console.log('Config file: ' + CONFIG_FILE);
     console.log(JSON.stringify(cfg, null, 2));
   });
