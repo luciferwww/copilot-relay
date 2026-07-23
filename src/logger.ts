@@ -12,8 +12,10 @@ function log(level: LogLevel, ...args: unknown[]): void {
   if (order[level] < order[current]) return;
   const stamp = new Date().toISOString();
   const line = `[${stamp}] [${level.toUpperCase()}]`;
-  // Send all log lines to stderr so stdout stays clean for CLI output.
-  console.error(line, ...args);
+  // Per spec §9 / requirement NFR5: all levels go to stdout (no file, no rotation).
+  // Command output that must stay pipe-friendly (config-show) lowers the level
+  // to `error` to keep stdout clean; see spec §1.6.
+  console.log(line, ...args);
 }
 
 export const logger = {
