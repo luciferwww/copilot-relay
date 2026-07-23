@@ -1,0 +1,25 @@
+{
+  "folders": [
+    {
+      "name": "copilot-relay",
+      "path": "c:/dev/copilot-relay"
+    },
+    {
+      "name": "vscode-extensions (reference, read-only)",
+      "path": "c:/Users/j-hongby/.vscode/extensions"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/node_modules": true,
+      "**/dist": false
+    },
+    "files.readonlyInclude": {
+      "c:/Users/j-hongby/.vscode/extensions/**": true
+    },
+    "search.exclude": {
+      "**/node_modules": true,
+      "c:/Users/j-hongby/.vscode/extensions/**/node_modules/**": true
+    }
+  }
+}
