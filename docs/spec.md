@@ -315,3 +315,123 @@ Token 相关字段最多输出前 8 字符 + `...(hidden)`。
 | 18.x, 20.x, 22.x | 支持 |
 
 平台: Windows 10+, macOS 12+, Linux (glibc)。
+
+## 11. 内部 API 契约
+
+跨模块的稳定接口。规格层只定义签名与语义,实现文件位置见
+[design.md](./design.md) §2。凡是本节列出的名字,任何模块均不得改签名而不
+同步更新本节。
+
+### 11.1 `auth/copilot.ts`
+
+```typescript
+interface EnsureOptions {
+  force?: boolean;  // true: 无视 5 min 阈值,立即向上游换新 token
+}
+
+function ensureCopilotToken(cfg: AppConfig, opts?: EnsureOptions): Promise<AuthState>;
+function loadAuth(): AuthState | null;
+function saveAuth(state: AuthState): void;
+function clearAuth(): void;
+function isAuthValid(state: AuthState | null): boolean;
+```
+
+- `ensureCopilotToken`
+  - 若 `loadAuth() == null` → 抛 `Error("Not logged in")`。
+  - 若 `opts?.force !== true` 且 `copilotExpiresAt * 1000 - Date.now() > 5 * 60 * 1000`
+    → 返回缓存 state。
+  - 否则按 §7.1 换新 Copilot token,`saveAuth`,返回更新后的 state。
+  - 换 token 失败(长期 access_token 被 revoke) → 抛
+    `Error("access_token revoked")`,**`auth.json` 不覆写**,后续 `isAuthValid` 应为 `false`。
+- `loadAuth`:文件不存在或 JSON 非法 → `null`(不抛)。
+- `saveAuth`:写 `auth.json`,类 Unix 上 `chmod 0600`;Windows 不额外调
+  `icacls`(§3)。
+- `clearAuth`:删除 `auth.json`,不存在时静默。
+- `isAuthValid`:供 §1.3 `status` 的 `auth valid` 字段使用;
+  当且仅当 `state != null && state.accessToken` 存在且**上一次刷新未标记失败**
+  时返回 `true`。
+
+### 11.2 `config.ts`
+
+```typescript
+const DATA_DIR: string;      // ~/.copilot-relay
+const CONFIG_PATH: string;   // <DATA_DIR>/config.json
+const AUTH_PATH: string;     // <DATA_DIR>/auth.json
+const PID_PATH: string;      // <DATA_DIR>/server.pid
+const DEFAULT_CONFIG: AppConfig;
+
+function loadConfig(): AppConfig;
+function saveConfigDefaults(): void;
+```
+
+- `loadConfig`:读 `CONFIG_PATH`;缺失字段合并 `DEFAULT_CONFIG`(§5);
+  非法 JSON 视为空,不抛。
+- `saveConfigDefaults`:若 `CONFIG_PATH` 不存在则以 `DEFAULT_CONFIG` 创建
+  (供 §1.6 `config-show` 使用)。
+
+### 11.3 `server.ts`
+
+```typescript
+function handleRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  cfg: AppConfig
+): Promise<void>;
+```
+
+- 路由分发入口。捕获所有异常并按 §2.6 shape 写响应。
+- `res.headersSent === true` 时:若为流式则按 §2.8 写终止帧后 `res.end()`;
+  否则仅日志记录、不再写入。
+- 上游 401 处理见 §2.7;客户端断开处理见 §2.9。
+- 内部调用 `ensureCopilotToken(cfg)`,失败按 §2.6 回错。
+
+### 11.4 `translate/{openai,anthropic}.ts`
+
+每个 translator 导出同名符号(签名一致,行为按各自协议):
+
+```typescript
+interface UpstreamRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
+function buildUpstreamRequest(
+  inbound: http.IncomingMessage,
+  cfg: AppConfig,
+  auth: AuthState
+): UpstreamRequest;
+
+function formatError(
+  errClass: string,   // §2.6 允许的 OpenAI 分类字符串
+  message: string,
+  code?: string | null
+): object;             // 未 stringify;shape 按各自协议(§2.6)
+
+function writeStreamErrorFrame(
+  res: http.ServerResponse,
+  err: { class: string; message: string; code?: string | null }
+): void;                // 按 §2.8 字节格式写入,内部调用 res.end()
+```
+
+- `buildUpstreamRequest`:仅装配 URL + header,不发起 fetch。header 集合
+  按 §7.2。
+- `formatError`:返回 JSON body 对象。
+- `writeStreamErrorFrame`:幂等——首次调用后 `res.writableEnded` 为 true,
+  后续调用直接返回。
+
+### 11.5 `logger.ts`
+
+```typescript
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+interface Logger {
+  debug(msg: string, ...args: unknown[]): void;
+  info(msg: string, ...args: unknown[]): void;
+  warn(msg: string, ...args: unknown[]): void;
+  error(msg: string, ...args: unknown[]): void;
+  setLevel(l: LogLevel): void;
+}
+```
+
+- 单例导出。所有 level 写 **stdout**(§9);格式见 §9。
+- Token 脱敏(前 8 字符 + `...(hidden)`)由调用方保证,logger 不做正则扫描。
