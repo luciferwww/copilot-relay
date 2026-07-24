@@ -72,10 +72,19 @@ async function pollForToken(
   expiresIn: number,
 ): Promise<string> {
   const deadline = Date.now() + expiresIn * 1000;
-  let waitMs = Math.max(interval, 1) * 1000;
+  const baseInterval = Math.max(interval, 1) * 1000;
+  // Cap slow_down backoff so a chatty upstream cannot make us sleep past
+  // `deadline` before we notice.
+  const MAX_INTERVAL_MS = 60_000;
+  let waitMs = baseInterval;
 
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, waitMs));
+    // Cap this sleep by the remaining time so we cannot sleep past `deadline`
+    // and wake up only to report expiry. A negative value would sleep
+    // indefinitely on some platforms; clamp to 0.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(waitMs, remaining)));
 
     const res = await fetch(GH_TOKEN_URL, {
       method: 'POST',
@@ -86,13 +95,21 @@ async function pollForToken(
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
       }),
     });
+    if (!res.ok) {
+      // GitHub returns 200 for the documented OAuth states (pending / slow_down / etc).
+      // Non-2xx here means transport-level trouble (5xx, 429, HTML error page) that
+      // will not parse as AccessTokenResponse. Surface it instead of silently looping.
+      throw new Error(
+        `Device auth poll failed: ${res.status} ${(await res.text()).slice(0, 200)}`,
+      );
+    }
     const data = (await res.json()) as AccessTokenResponse;
 
     if (data.access_token) return data.access_token;
 
     if (data.error === 'authorization_pending') continue;
     if (data.error === 'slow_down') {
-      waitMs += 5000;
+      waitMs = Math.min(waitMs + 5000, MAX_INTERVAL_MS);
       continue;
     }
     throw new Error(

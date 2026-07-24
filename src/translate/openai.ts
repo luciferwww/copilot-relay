@@ -1,6 +1,7 @@
 import type http from 'node:http';
 import type { AuthState } from '../auth/copilot.js';
 import type { AppConfig } from '../config.js';
+import { buildCopilotBaseHeaders, extractQueryString } from './shared.js';
 
 export interface UpstreamRequest {
   url: string;
@@ -18,12 +19,8 @@ export function buildUpstreamRequest(
   const url = `${base}/chat/completions${qs}`;
 
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${auth.copilotToken ?? ''}`,
+    ...buildCopilotBaseHeaders(cfg, auth),
     'Content-Type': 'application/json',
-    'User-Agent': cfg.userAgent,
-    'Editor-Version': cfg.editorVersion,
-    'Editor-Plugin-Version': cfg.editorPluginVersion,
-    'Copilot-Integration-Id': cfg.copilotIntegrationId,
     'Openai-Intent': 'conversation-panel',
   };
 
@@ -61,15 +58,4 @@ export function writeStreamErrorFrame(
   };
   res.write(`data: ${JSON.stringify(body)}\n\n`);
   res.end();
-}
-
-/**
- * Extract the `?...` portion (including the leading `?`) from an inbound URL,
- * or empty string if there isn't one. Preserves query params (e.g. api-version)
- * that upstream may act on.
- */
-function extractQueryString(inbound: string | undefined): string {
-  if (!inbound) return '';
-  const q = inbound.indexOf('?');
-  return q >= 0 ? inbound.slice(q) : '';
 }

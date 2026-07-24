@@ -1,14 +1,10 @@
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import type { AppConfig } from './config.js';
-import {
-  ensureCopilotToken,
-  isAuthValid,
-  loadAuth,
-  type AuthState,
-} from './auth/copilot.js';
+import { ensureCopilotToken, type AuthState } from './auth/copilot.js';
 import * as openaiTr from './translate/openai.js';
 import * as anthropicTr from './translate/anthropic.js';
+import { buildCopilotBaseHeaders } from './translate/shared.js';
 import { logger } from './logger.js';
 
 export interface ServerHandle {
@@ -118,12 +114,13 @@ async function proxy(
     try {
       auth = await ensureCopilotToken(cfg);
     } catch (err) {
-      // Spec §2.7 rule 3 / §11.1 — refresh failure or absent auth: return 401.
-      const status = isAuthValid(loadAuth()) ? 502 : 401;
+      // Spec §2.7 rule 3 / §11.1 — any ensureCopilotToken failure is treated
+      // uniformly as an auth failure (v0.1 does not distinguish transient vs.
+      // permanent). Always respond 401.
       respondError(
         res,
         translator,
-        status,
+        401,
         'authentication_error',
         (err as Error)?.message ?? 'authentication failure',
       );
@@ -252,11 +249,11 @@ async function proxyModels(
     try {
       auth = await ensureCopilotToken(cfg);
     } catch (err) {
-      const status = isAuthValid(loadAuth()) ? 502 : 401;
+      // Spec §2.7 rule 3 / §11.1 — always respond 401 on ensureCopilotToken failure.
       respondError(
         res,
         openaiTr,
-        status,
+        401,
         'authentication_error',
         (err as Error)?.message ?? 'authentication failure',
       );
@@ -335,14 +332,10 @@ async function callModelsUpstream(
 ): Promise<Response> {
   const base = auth.copilotApiBase ?? 'https://api.githubcopilot.com';
   const url = `${base}/models`;
-  // Per spec §7.2 minus Content-Type (GET has no body).
+  // Spec §7.2 minus Content-Type (GET has no body).
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${auth.copilotToken ?? ''}`,
+    ...buildCopilotBaseHeaders(cfg, auth),
     Accept: 'application/json',
-    'User-Agent': cfg.userAgent,
-    'Editor-Version': cfg.editorVersion,
-    'Editor-Plugin-Version': cfg.editorPluginVersion,
-    'Copilot-Integration-Id': cfg.copilotIntegrationId,
   };
   logger.debug(`-> GET ${url}`);
   return await fetch(url, { method: 'GET', headers, signal });

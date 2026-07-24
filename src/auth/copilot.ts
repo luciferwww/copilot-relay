@@ -79,8 +79,20 @@ export async function refreshCopilotToken(
   });
   if (!res.ok) {
     // Persist the failure marker but do NOT overwrite the copilot token fields
-    // (spec §11.1: refreshed fields not overwritten on failure).
-    const reason = `Copilot token exchange failed: ${res.status} ${await res.text()}`;
+    // (spec §11.1: on refresh failure, previously stored token fields are kept as-is).
+    // Truncate the upstream body so a large HTML error page cannot bloat auth.json
+    // (or any log line that echoes this message). Slice by code points (via
+    // Array.from) rather than UTF-16 code units so a multi-byte character
+    // (emoji, CJK supplementary plane) is not cut in the middle, which would
+    // leave a lone surrogate that renders as a replacement character downstream.
+    const MAX_BODY_CODEPOINTS = 500;
+    const rawBody = await res.text();
+    const codePoints = Array.from(rawBody);
+    const bodyExcerpt =
+      codePoints.length > MAX_BODY_CODEPOINTS
+        ? codePoints.slice(0, MAX_BODY_CODEPOINTS).join('') + '…(truncated)'
+        : rawBody;
+    const reason = `Copilot token exchange failed: ${res.status} ${bodyExcerpt}`;
     saveAuth({ ...state, lastRefreshError: reason });
     throw new Error(reason);
   }
