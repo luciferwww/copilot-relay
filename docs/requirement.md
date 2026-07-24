@@ -2,61 +2,46 @@
 
 > Status: draft, aligned with the v0.1 MVP agreed 2026-07-23.
 
-## 1. 背景
+## 1. Background
 
-越来越多第三方 AI Agent(如 Claude Code、Codex CLI、以及自研 agent)以
-OpenAI (`/v1/chat/completions`) 或 Anthropic (`/v1/messages`) 兼容 API 作为
-模型接入协议。要让这些 agent 复用 GitHub Copilot 订阅背后的模型能力,
-需要一个能把 OpenAI / Anthropic 请求翻译到 Copilot 后端协议、并处理
-GitHub 认证与短期 token 刷新的本地代理。
+A growing number of third-party AI agents (Claude Code, Codex CLI, in-house agents, and so on) use the OpenAI (`/v1/chat/completions`) or Anthropic (`/v1/messages`) HTTP APIs as their model-access protocol. To let these agents reuse the models behind a GitHub Copilot subscription, we need a local proxy that translates OpenAI / Anthropic requests to Copilot's upstream protocol and handles GitHub authentication plus short-lived Copilot token refresh.
 
-现有方案存在缺口:
+Existing solutions leave a gap:
 
-- GitHub 官方未提供独立的、面向第三方 agent 的 Copilot 模型代理。
-- Copilot Chat 等 VS Code 扩展把该能力绑死在编辑器进程内,无法给
-  CLI / 后台服务直接使用。
+- GitHub does not officially provide a standalone Copilot model proxy for third-party agents.
+- Extensions such as Copilot Chat bind this capability to the editor process, so CLIs and background services cannot use it directly.
 
-本项目提供一个**独立、无 VS Code 依赖**的本地 CLI 代理,让任何支持
-OpenAI / Anthropic API 的第三方 agent 都能通过用户自己的 GitHub Copilot
-订阅调用模型,专注个人使用场景。实现基于公开的 GitHub Copilot HTTP
-协议独立完成。
+This project provides a **standalone, VS Code-independent** local CLI proxy so any agent that speaks OpenAI or Anthropic APIs can use the user's own GitHub Copilot subscription. The focus is personal use. Implementation relies on the public GitHub Copilot HTTP protocol only.
 
-## 2. 目标 (Goals)
+## 2. Goals
 
-- G1. 以本地 HTTP 服务形式提供 OpenAI (`/v1/chat/completions`) 和
-  Anthropic (`/v1/messages`) 兼容 API,后端为 GitHub Copilot。
-- G2. 独立于 VS Code 运行:不依赖 `vscode` 模块、不依赖 Copilot Chat 扩展,
-  纯 Node.js CLI。
-- G3. 支持流式响应(SSE)。
-- G4. 支持 GitHub device-code 登录流程,自持并自动刷新 Copilot 短期 token。
-- G5. 提供一键配置目标客户端(v0.1 仅 Claude Code)。
+- **G1.** Provide a local HTTP service exposing OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`) APIs, backed by GitHub Copilot.
+- **G2.** Run independently of VS Code: no dependency on the `vscode` module or the Copilot Chat extension. Pure Node.js CLI.
+- **G3.** Support streaming responses (SSE).
+- **G4.** Support the GitHub device-code login flow; own and auto-refresh the short-lived Copilot token.
+- **G5.** Provide one-command configuration of the target client (v0.1 supports Claude Code only).
 
-## 3. 非目标 (Non-Goals)
+## 3. Non-Goals
 
-- N1. v0.1 仅支持 GitHub Copilot 后端,不扩展到其他提供商。
-- N2. 不实现遥测 / 使用量上报。
-- N3. 不实现自动版本检查、自动更新。
-- N4. 不提供图形界面。
-- N5. 不实现入站鉴权(API key / mTLS 等);v0.1 依赖 loopback 隔离保证
-  只有本机进程能调用代理(见 NFR7)。
+- **N1.** v0.1 targets the GitHub Copilot backend only; no other providers.
+- **N2.** No telemetry or usage reporting.
+- **N3.** No automatic version check or auto-update.
+- **N4.** No graphical UI.
+- **N5.** No inbound authentication (API key / mTLS / etc.); v0.1 relies on loopback isolation to guarantee that only local processes can reach the proxy (see NFR7).
 
-## 4. 用户故事 (User Stories)
+## 4. User Stories
 
-- **US1**:作为 Copilot 订阅用户,我想让 Claude Code CLI 通过我的 Copilot
-  订阅访问 Claude 模型,无需另买 Anthropic API key。
-- **US2**:作为开发者,我想在本机启动一个代理,把所有 OpenAI 兼容 SDK 指到
-  `http://127.0.0.1:5000` 就能用上 Copilot 模型。
-- **US3**:作为终端用户,我希望首次登录用 device-code 流程,不必手工粘贴
-  token。
-- **US4**:我希望 token 到期时代理自动刷新,不打断我的请求。
-- **US5**:我希望能通过 `copilot-relay status` 快速知道当前认证状态和 token
-  过期时间。
+- **US1.** As a Copilot subscriber, I want Claude Code CLI to access Claude models through my Copilot subscription without buying a separate Anthropic API key.
+- **US2.** As a developer, I want to start a local proxy and point any OpenAI-compatible SDK at `http://127.0.0.1:5000` to use Copilot models.
+- **US3.** As an end user, I want the first-time login to use the device-code flow so I never paste tokens by hand.
+- **US4.** I want the proxy to refresh the token automatically before it expires, without interrupting my requests.
+- **US5.** I want `copilot-relay status` to quickly show the current auth state and token expiry.
 
-## 5. 功能需求 (Functional)
+## 5. Functional Requirements
 
-### FR1. CLI 命令
+### FR1. CLI Commands
 
-| 命令 | 必需 |
+| Command | Required |
 |---|---|
 | `copilot-relay login` | ✅ |
 | `copilot-relay logout` | ✅ |
@@ -67,98 +52,78 @@ OpenAI / Anthropic API 的第三方 agent 都能通过用户自己的 GitHub Cop
 | `copilot-relay configure claude` | ✅ |
 | `copilot-relay configure codex` | ⏳ v0.2 |
 
-> 默认监听端口 `5000`,可用 `--port` 覆盖;监听地址固定 `127.0.0.1`(见 NFR7)。
+> Default listen port is `5000`, overridable with `--port`. The listen address is fixed at `127.0.0.1` (see NFR7).
 
-### FR2. HTTP 路由
+### FR2. HTTP Routes
 
-| 路由 | 必需 |
+| Route | Required |
 |---|---|
-| `POST /v1/chat/completions` (OpenAI, 支持流式) | ✅ |
-| `POST /v1/messages` (Anthropic, 支持流式) | ✅ |
-| `GET  /v1/models` (透传上游) | ✅ |
-| `GET  /health` | ✅ |
+| `POST /v1/chat/completions` (OpenAI; streaming supported) | ✅ |
+| `POST /v1/messages` (Anthropic; streaming supported) | ✅ |
+| `GET /v1/models` (proxied from upstream) | ✅ |
+| `GET /health` | ✅ |
 
-### FR3. 认证
+### FR3. Authentication
 
-- 使用 GitHub OAuth **device-code** flow 获取长期 access_token。
-- 用 access_token 调用 `GET https://api.github.com/copilot_internal/v2/token`
-  换取短期 Copilot token(`expires_at` 通常 30 分钟)。
-- Copilot token 距过期 ≤ 5 分钟时自动刷新。
-- 刷新失败(长期 access_token 被 revoke 等)时,请求返回 401,并在
-  `copilot-relay status` 中标记认证失效,提示重跑 `copilot-relay login`。
+- Use the GitHub OAuth **device-code** flow to obtain a long-lived access token.
+- Use that access token against `GET https://api.github.com/copilot_internal/v2/token` to obtain a short-lived Copilot token (`expires_at` is typically 30 minutes).
+- Refresh the Copilot token automatically when its remaining lifetime is ≤ 5 minutes.
+- If refresh fails (e.g., the long-lived access token has been revoked), respond to the current request with 401, mark auth as invalid in `copilot-relay status`, and prompt the user to re-run `copilot-relay login`.
 
-### FR4. 持久化
+### FR4. Persistence
 
-- 配置: `~/.copilot-relay/config.json`
-- 认证态: `~/.copilot-relay/auth.json`。类 Unix 上 `chmod 0600`;Windows 上不
-  额外调用 `icacls`,依赖 `%USERPROFILE%` 目录本身的 ACL。
-- PID 文件: `~/.copilot-relay/server.pid`
+- Config: `~/.copilot-relay/config.json`
+- Auth state: `~/.copilot-relay/auth.json`. On Unix-like systems, `chmod 0600`. On Windows, no `icacls` call — the file relies on the `%USERPROFILE%` directory's own ACL.
+- PID file: `~/.copilot-relay/server.pid`
 
-### FR5. 错误映射
+### FR5. Error Mapping
 
-上游 Copilot 返回的错误按客户端协议 shape 转换:
+Errors returned by upstream Copilot must be rewritten to match the client's protocol shape:
 
-- OpenAI 端(`/v1/chat/completions`、`/v1/models`)返回
-  `{ error: { type, message, code } }`。
-- Anthropic 端(`/v1/messages`)返回
-  `{ type: "error", error: { type, message } }`。
+- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) return
+  `{ error: { type, message, code } }`.
+- Anthropic endpoint (`/v1/messages`) returns
+  `{ type: "error", error: { type, message } }`.
 
-HTTP 状态码尽量透传;无法分类时统一为 `502`。
+Pass the upstream HTTP status through where possible; when unclassifiable, use `502`.
 
-**上游 401 处理**:Copilot token 可能在未到刷新阈值前被上游作废(轮换 /
-撤销)。遇到上游 401 时,代理强制刷新一次 Copilot token 并重试原请求;
-二次仍 401 才按上述 shape 透传给客户端,同时在日志中提示重跑
-`copilot-relay login`。重试仅允许在上游首个响应到达前发生;若 SSE 已开始转
-发则不重试,直接按 FR6 终止流。
+**Handling upstream 401:** the Copilot token may be invalidated by upstream (rotation or revocation) before its local expiry threshold triggers a refresh. On an upstream 401, the proxy force-refreshes the Copilot token once and retries the original request; a second 401 is then rewritten per the shapes above and passed to the client, and the log hints at re-running `copilot-relay login`. Retry is only allowed before the first upstream response byte arrives — if SSE forwarding has already begun, do not retry; terminate the stream per FR6.
 
-### FR6. 请求生命周期
+### FR6. Request Lifecycle
 
-- 客户端断开连接时代理应 abort 上游请求(避免白烧 Copilot 额度)。
-- 流式响应中途上游报错时按对应协议终止:
-  - OpenAI 端发一个 `data: {"error": {...}}\n\n` chunk 后直接关流,
-    **不再发 `data: [DONE]`**(SDK 会将 `[DONE]` 视为正常结束并吞掉错误)。
-  - Anthropic 端发 `event: error` 后关流。
-- 实现前需实测 `openai` / `@anthropic-ai/sdk` 对上述终止序列的行为,避免
-  SDK 静默吞错。
+- When the client disconnects, the proxy must abort the upstream request (to avoid wasting Copilot quota).
+- If the upstream errors mid-stream, terminate the response per the client protocol:
+  - OpenAI: emit a `data: {"error": {...}}\n\n` chunk then close the stream. **Do not emit `data: [DONE]`** — SDKs treat `[DONE]` as normal completion and would swallow the error.
+  - Anthropic: emit `event: error\ndata: {"type":"error","error":{...}}\n\n` then close the stream.
+- The termination sequences above must produce observable errors in the `openai` and `@anthropic-ai/sdk` clients — the error must not be silently swallowed as a normal end-of-stream.
 
-## 6. 非功能需求 (Non-Functional)
+## 6. Non-Functional Requirements
 
-- **NFR1 - 平台**:Windows / macOS / Linux 全支持,Node.js ≥ 18(原生 `fetch`)。
-- **NFR2 - 依赖**:runtime 依赖保持极小(当前仅 `commander`、`open`);
-  权威清单以 `package.json` 的 `dependencies` 为准。
-- **NFR3 - 启动时延**:`copilot-relay start` 定性目标“快”(近似普通 Node CLI),
-  不作具体毫秒阈值承诺。
-- **NFR4 - 代理开销**:代理层对流式响应不做缓冲,无额外拷贝;不对首字节
-  延时作具体毫秒承诺。
-- **NFR5 - 安全 与 日志**:auth.json 权限收窄;token 不进日志(即使
-  `--log-level debug` 也只打印前 8 字符)。日志写 stdout,不落盘、不轮转。
-- **NFR6 - 可移植性**:所有代码 100 % TypeScript,`tsc` 一次编译产出即可
-  `node dist/cli.js` 运行,不使用 loader / bundler。
-- **NFR7 - 绑定地址**:仅监听 `127.0.0.1`,不支持 `0.0.0.0` 或外网 IP;
-  同局域网内其他主机应无法连接。`host` 不开放为可配项(config.json /
-  环境变量 / CLI flag 均不可覆盖);需要 LAN 访问属 v0.1 外场景,自行 fork。
+- **NFR1 — Platform:** Windows / macOS / Linux fully supported, Node.js ≥ 18 (for native `fetch`).
+- **NFR2 — Dependencies:** Keep runtime dependencies minimal (currently `commander`, `open`). The authoritative list is the `dependencies` field of `package.json`.
+- **NFR3 — Startup latency:** No specific threshold is defined for v0.1. Egregious regressions block release; otherwise treated case-by-case.
+- **NFR4 — Proxy overhead:** The proxy layer must not buffer streaming responses and must not perform extra data copying. No specific time-to-first-byte threshold is defined for v0.1.
+- **NFR5 — Security & logging:** `auth.json` has restrictive permissions; tokens must never appear in logs (even at `--log-level debug`, only the first 8 characters are printed). Logs go to stdout only — no file, no rotation.
+- **NFR6 — Portability:** 100% TypeScript. A single `tsc` build produces artifacts runnable via `node dist/cli.js`; no loader or bundler is used.
+- **NFR7 — Bind address:** Listen on `127.0.0.1` only. `0.0.0.0` and external IPs are not supported; other hosts on the same LAN must be unable to connect. `host` is not exposed as a configurable field (no override via `config.json`, environment variable, or CLI flag). LAN access is out of scope for v0.1; fork the project if needed.
 
-## 7. 约束与假设
+## 7. Constraints and Assumptions
 
-- **A1**:Copilot HTTP 协议 (`api.githubcopilot.com`) 请求头格式在本项目
-  开发周期内保持稳定。若上游变更,请求头(`Editor-Version` 等)通过
-  配置文件可覆盖,无需改代码。
-- **A2**:默认 `githubClientId` 采用社区已有 OSS Copilot 客户端普遍使用的
-  公开值;用户可换成自己的 OAuth App id。
-- **C1**:必须遵守 GitHub Copilot 订阅协议,不得共享 token、不得将本项目用于
-  未授权的商用转售。
+- **A1.** The Copilot HTTP protocol (`api.githubcopilot.com`) request-header format is assumed stable within the project's development window. If upstream changes, header values (`Editor-Version`, etc.) are configurable and require no code changes.
+- **A2.** The default `githubClientId` uses the widely-used public value found in existing community open-source Copilot clients. Users can substitute their own OAuth App id.
+- **C1.** Users must comply with the GitHub Copilot subscription terms. Tokens must not be shared, and the project must not be used for unauthorized commercial resale. NFR7's loopback-only binding is a technical safeguard against LAN-local token misuse, but overall compliance responsibility rests with the user.
 
-## 8. 验收标准 (Acceptance Criteria)
+## 8. Acceptance Criteria
 
-- AC1. `npm install && npm run build && node dist/cli.js --help` 能列出所有命令。
-- AC2. `node dist/cli.js login` 引导用户完成 device-code 登录,并把 auth.json
-       写盘。
-- AC3. `node dist/cli.js start` 后,`curl http://127.0.0.1:<默认端口>/health` 返回
-       `{"ok":true}`。
-- AC4. 选一个 `/v1/models` 返回的 `id`(以下以 `<model-id>` 为占位),执行
-       `curl -N -H 'Content-Type: application/json' \
-         -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
-         http://127.0.0.1:<默认端口>/v1/chat/completions` 能逐块收到 SSE 响应。
-- AC5. 将 auth.json 中 `copilot.expires_at` 手工回退到过去时间后,下一次
-       向 `/v1/chat/completions` 发非流式请求应自动刷新 Copilot token 并返回
-       200,不报 401。
+- **AC1.** `npm install && npm run build && node dist/cli.js --help` lists all commands.
+- **AC2.** `node dist/cli.js login` guides the user through the device-code login and persists `auth.json`.
+- **AC3.** After `node dist/cli.js start`, `curl http://127.0.0.1:<default-port>/health` returns `{"ok":true}`.
+- **AC4.** Given an `id` from the `/v1/models` response (denoted `<model-id>` below):
+  ```
+  curl -N -H 'Content-Type: application/json' \
+    -d '{"model":"<model-id>","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+    http://127.0.0.1:<default-port>/v1/chat/completions
+  ```
+  produces a streamed SSE response, chunk by chunk.
+- **AC5.** After manually setting `copilotExpiresAt` in `auth.json` to a past epoch second, the next non-streaming request to `/v1/chat/completions` must auto-refresh the Copilot token and return 200 — not 401.
+- **AC6.** After manually replacing `copilotToken` in `auth.json` with a value the upstream will reject (while `copilotExpiresAt` is still in the future), the next request to `/v1/chat/completions` must trigger the reactive refresh in FR5 (force-refresh once, retry) and ultimately return 200 — not 401 or 5xx.

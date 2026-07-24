@@ -1,247 +1,316 @@
-# 编码规范
+# Coding Standards
 
-> 创建日期：2026-04-07  
-> 适用范围：my-agent 项目所有 TypeScript 代码
+> Created: 2026-04-07  
+> Scope: template for TypeScript projects. Copy into a new codebase and adapt as needed.
 
-本文档总结自现有代码库的实际风格，新代码应保持一致。
+These conventions are the recommended starting point for any TypeScript project. When adopting this template, review each rule and revise your project's copy for any rule that does not fit — but do so intentionally, not by omission.
 
----
+### Rule Tiers
 
-## 1. 文件命名
+Each section (or bullet, when mixed) is tagged with one of:
 
-| 类型 | 命名风格 | 示例 |
-|------|---------|------|
-| 类/主模块 | PascalCase | `AgentRunner.ts`, `SessionManager.ts` |
-| 工具/辅助函数 | kebab-case | `read-file.ts`, `run-command.ts`, `path-policy.ts` |
-| 类型定义 | `types.ts` | 每个模块一个，或 `types/` 子目录 |
-| 模块入口 | `index.ts` | 只做 re-export，不含实现 |
-| 测试 | 与源文件同名 + `.test.ts` | `AgentRunner.test.ts`, `lock.test.ts` |
+- **(Rule)** — Must follow. Deviations require explicit justification in code review or a comment.
+- **(Default)** — Recommended starting point. Override in your project's copy if a listed exception applies.
+- **(Guidance)** — Patterns to consider; author judgment applies.
 
 ---
 
-## 2. 目录命名
+## 1. File Naming *(Rule)*
 
-一律 **kebab-case**：
+| Kind | Style | Example |
+|------|-------|---------|
+| Class / main module | PascalCase | `OrderService.ts`, `UserRepository.ts` |
+| Utility / helper | kebab-case | `parse-input.ts`, `format-date.ts`, `retry-policy.ts` |
+| Type definitions | `types.ts` | One per module, or a `types/` subdirectory |
+| Module entry | `index.ts` | Re-exports only, no implementation |
+| Tests | Same name as source + `.test.ts` | `OrderService.test.ts`, `parse-input.test.ts` |
+
+---
+
+## 2. Directory Naming *(Rule)*
+
+Directory names are always **kebab-case**. This rule applies to folder names only; individual files follow Section 1.
 
 ```
-agent-runner/    llm-client/    prompt-builder/    session/    tools/
+user-service/    order-store/    report-builder/    http-client/    utils/
 ```
 
 ---
 
-## 3. 命名规则
+## 3. Formatting *(Rule)*
 
-| 类别 | 风格 | 示例 |
-|------|------|------|
-| 类 | PascalCase，无前后缀 | `AgentRunner`, `SessionManager` |
-| 接口 | PascalCase，无 `I` 前缀 | `RunParams`, `ToolResult`, `SessionEntry` |
-| 函数 | camelCase | `loadStore()`, `extractText()`, `createMemoryTools()` |
-| 变量 | camelCase | `sessionManager`, `currentText`, `workspaceDir` |
-| 常量 | UPPER_SNAKE_CASE | `DEFAULT_MAX_TOKENS`, `SESSIONS_DIR` |
-| 私有成员 | `private` 关键字 + camelCase | `private llmClient`, `private transcripts` |
+| Setting | Value |
+|---------|-------|
+| Indentation | 2 spaces, no tabs |
+| Quotes | Single quotes (`'…'`); use backticks only for template literals |
+| Semicolons | Required at the end of every statement |
 
-### 接口命名后缀惯例
-
-| 后缀 | 用途 | 示例 |
-|------|------|------|
-| `Config` / `Options` | 构造参数、配置 | `AgentRunnerConfig`, `LoadContextFilesOptions` |
-| `Params` / `Input` | 方法参数 | `RunParams`, `ChatParams`, `UserPromptInput` |
-| `Result` / `Response` | 返回值 | `RunResult`, `ChatResponse`, `ToolResult` |
-| `Entry` / `Record` | 数据条目 | `SessionEntry`, `MessageRecord` |
-| `Event` | 事件 | `AgentEvent`, `StreamEvent` |
-| `Definition` | 定义/描述 | `ToolDefinition`, `ChatToolDefinition` |
+Anything not listed here is at the author's discretion.
 
 ---
 
-## 4. 模块结构
+## 4. Naming Rules
 
-典型模块组织：
+*(Rule)* — the main table below.
+
+| Category | Style | Example |
+|----------|-------|---------|
+| Class | PascalCase, no pre/suffix | `OrderService`, `UserRepository` |
+| Interface | PascalCase, no `I` prefix | `QueryParams`, `FetchResult`, `UserEntry` |
+| Function | camelCase | `loadConfig()`, `parseInput()`, `createCache()` |
+| Variable | camelCase | `userRepo`, `currentValue`, `outputDir` |
+| Constant | UPPER_SNAKE_CASE | `DEFAULT_TIMEOUT_MS`, `CACHE_DIR` |
+| Private member | `private` keyword + camelCase | `private httpClient`, `private cache` |
+
+Note: `static readonly` class fields representing constants may use UPPER_SNAKE_CASE (like module-level constants). The `readonly` modifier on instance fields does not change the case — instance fields remain camelCase.
+
+### Interface Suffix Conventions *(Default)*
+
+| Suffix | Purpose | Example |
+|--------|---------|---------|
+| `Config` / `Options` | Constructor params, configuration | `OrderServiceConfig`, `LoadUsersOptions` |
+| `Params` / `Input` | Method parameters | `QueryParams`, `SearchParams`, `LoginInput` |
+| `Result` / `Response` | Return values | `QueryResult`, `SearchResponse`, `FetchResult` |
+| `Entry` / `Record` | Data records | `UserEntry`, `EventRecord` |
+| `Event` | Events | `OrderEvent`, `StreamEvent` |
+| `Definition` | Definitions / descriptors | `RouteDefinition`, `PluginDefinition` |
+
+---
+
+## 5. Type-Level Conventions *(Default)*
+
+### `null` vs `undefined`
+
+**Prefer `undefined` throughout the codebase.** Use `null` only at boundaries where an external contract (JSON API, database column) requires it as a distinct value.
+
+Rationale:
+- TypeScript's optional syntax (`x?: T`) produces `undefined`; using one sentinel avoids branching on both.
+- `JSON.stringify` drops `undefined`, and default parameters / destructuring defaults only trigger on `undefined`.
+- One sentinel means one type of null-check, not two.
+
+**Override when:** the domain requires distinguishing "explicitly cleared" from "never set" (e.g., form fields, PATCH-style APIs). In that case, use `null` for the "explicit empty" state and document the distinction on the relevant type. Do not allow both in the same field — choose `T | undefined` or `T | null`, not `T | null | undefined`.
+
+### Literal unions over `enum`
+
+**Prefer string-literal unions:**
+
+```typescript
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+```
+
+When runtime iteration is needed, derive the type from a `readonly` tuple:
+
+```typescript
+const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
+type LogLevel = typeof LOG_LEVELS[number];
+```
+
+Rationale: zero runtime cost, tree-shakeable, JSON-friendly, no surprising numeric reverse mapping.
+
+**Override when:** interop with a third-party API demands an `enum` value.
+
+### `readonly` by default
+
+- Mark class fields `readonly` unless mutation is required. Constructor-injected dependencies are always `readonly`.
+- Type collection parameters as `readonly T[]` (or `ReadonlyMap` / `ReadonlySet`) when the function does not mutate them.
+- Do not adopt deep-immutability libraries (Immer, Immutable.js); shallow `readonly` is sufficient for compile-time safety.
+
+Rationale: zero runtime cost; documents intent; prevents accidental mutation bugs.
+
+---
+
+## 6. Module Structure *(Guidance)*
+
+A typical module layout:
 
 ```
 module-name/
-├── ClassName.ts           # 主类（PascalCase）
-├── helper-name.ts         # 辅助函数（kebab-case）
-├── types.ts               # 接口和类型
-├── index.ts               # re-export 公共 API
-├── ClassName.test.ts      # 主类测试
-└── helper-name.test.ts    # 辅助函数测试
+├── ClassName.ts           # Main class (PascalCase)
+├── helper-name.ts         # Helper functions (kebab-case)
+├── types.ts               # Interfaces and types
+├── index.ts               # Re-export public API
+├── ClassName.test.ts      # Main class tests
+└── helper-name.test.ts    # Helper function tests
 ```
 
-- 接口统一放在 `types.ts`（或 `types/` 子目录），不为单个接口建文件
-- `index.ts` 只做 re-export，不含实现逻辑
-- 辅助函数文件用 kebab-case（如 `store.ts`, `lock.ts`, `transcript.ts`）
+- Keep interfaces in `types.ts` (or a `types/` subdirectory); do not create a file per interface.
+- `index.ts` only re-exports; no implementation logic.
+- Helper files use kebab-case (e.g., `token-parser.ts`, `response-cache.ts`, `input-validator.ts`).
 
 ---
 
-## 5. 导入导出
+## 7. Imports & Exports *(Rule)*
 
-### 导入
+### Imports
 
 ```typescript
-// 值导入
-import { SessionManager } from './SessionManager.js';
-import { readFile } from 'fs/promises';
+// Value imports
+import { OrderService } from './OrderService.js';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-// 类型导入（单独的 import type）
-import type { SessionEntry, MessageRecord } from './types.js';
-import type { LLMClient, ChatMessage } from '../llm-client/types.js';
+// Type imports (separate `import type`)
+import type { UserEntry, EventRecord } from './types.js';
+import type { HttpClient, ApiMessage } from '../http-client/types.js';
 ```
 
-规则：
-- 相对路径始终带 `.js` 后缀
-- 类型导入使用 `import type` 分开写
-- Node.js 内置模块可用 `node:` 前缀或不带
+- Relative paths always carry the `.js` suffix (required by ESM resolution).
+- Use `import type` for type-only imports.
+- Always use the `node:` prefix for Node.js built-in imports (e.g., `node:path`, `node:fs/promises`).
 
-### 导出
+### Exports
 
 ```typescript
-// 类和函数：命名导出
-export class AgentRunner { }
-export function loadStore() { }
-export const execTool: Tool = { };
+// Classes and functions: named exports
+export class OrderService { }
+export function loadConfig() { }
 
-// index.ts 中的 re-export
-export { AgentRunner } from './AgentRunner.js';
-export type { RunParams, RunResult, AgentEvent } from './types.js';
+// Re-exports in index.ts
+export { OrderService } from './OrderService.js';
+export type { QueryParams, QueryResult, OrderEvent } from './types.js';
 ```
 
-规则：
-- 使用命名导出，不用 default export
-- `export type` 用于纯类型的 re-export
+- Prefer named exports; avoid `default` export.
+- Use `export type` for pure type re-exports.
 
 ---
 
-## 6. 注释
+## 8. Comments
 
-### JSDoc — 公共 API
+### JSDoc — public API *(Rule)*
+
+Format: a one-line summary, a blank line, then any additional detail.
 
 ```typescript
 /**
- * Agent 执行引擎，串联所有模块完成一次完整的对话循环。
+ * Processes an incoming order and returns a receipt.
  *
- * 两层循环结构：
- * - 外层：处理 followUp 消息
- * - 内层：LLM 调用 + tool use 循环
+ * Retries transient upstream failures up to `maxRetries` times.
  */
-export class AgentRunner { }
+export function processOrder(order: Order): Receipt { }
 ```
 
-### 行内注释 — 逻辑说明
+### Inline comments *(Guidance)*
 
 ```typescript
-// 从 session 加载历史消息，转换为 ChatMessage[]
-const history = this.loadHistory(params.sessionKey);
+// Load history from the store and convert to ApiMessage[]
+const history = this.loadHistory(params.userId);
 ```
 
-### 分隔线 — 文件内分区
+### Section dividers *(Guidance)*
 
 ```typescript
-// ── Section 1: agent-identity ──────────────────────────────
-// ── 内部方法 ──────────────────────────────────────────
+// ── Section 1: user-auth ──────────────────────────────
+// ── Internal methods ──────────────────────────────────
 ```
 
-- 中英文均可，保持同一文件内风格统一
-- 不写多余的 `@param` / `@returns`，TypeScript 类型已经表达了
+### Language & content *(Rule)*
+
+- Write all comments in English.
+- Do not add redundant `@param` / `@returns`; TypeScript types already express them.
 
 ---
 
-## 7. 错误处理
+## 9. Error Handling *(Rule)*
 
 ```typescript
-// 抛出错误：明确的错误消息
-throw new Error(`Session key "${key}" not found`);
+// Throwing: use an explicit, actionable message
+throw new Error(`User "${id}" not found`);
 
-// 捕获错误：类型守卫
+// Rethrowing: attach context via `cause`
 try {
-  await operation();
+  await syncUser(id);
 } catch (err) {
-  const error = err instanceof Error ? err : new Error(String(err));
-  throw error;
+  const cause = err instanceof Error ? err : new Error(String(err));
+  throw new Error(`Failed to sync user "${id}"`, { cause });
 }
 
-// 工具返回错误：isError 标记
-return {
-  content: `Error: ${message}`,
-  isError: true,
-};
-
-// 文件不存在等预期错误：静默跳过
+// Expected errors (e.g., missing file): skip silently
 try {
-  rawContent = await readFile(filePath, 'utf-8');
+  rawContent = await readFile(filePath, 'utf-8'); // from node:fs/promises
 } catch {
-  continue; // 文件不存在，跳过
+  continue; // File does not exist; skip
 }
 ```
 
+- Every thrown `Error` message should include the relevant identifier or path.
+- Only swallow an error when the absence of a resource is a normal, expected state.
+- When rethrowing, add context via `new Error(msg, { cause })`; do not rethrow unchanged.
+
 ---
 
-## 8. 异步模式
+## 10. Async Patterns *(Guidance)*
 
 ```typescript
-// 标准：async/await
-async run(params: RunParams): Promise<RunResult> {
-  const result = await this.callLLM(params);
+// Standard: async/await
+async search(params: QueryParams): Promise<QueryResult> {
+  const result = await this.callApi(params);
   return result;
 }
 
-// 流式：AsyncIterable
-async *chatStream(params: ChatParams): AsyncIterable<StreamEvent> {
+// Streaming: AsyncGenerator
+async *watchEvents(params: WatchParams): AsyncGenerator<StreamEvent> {
+  const stream = await this.openStream(params);
   for await (const event of stream) {
     yield event;
   }
 }
 
-// 回调：简单场景用可选回调
-onEvent?: (event: AgentEvent) => void;
+// Callback: optional callback for simple cases
+onEvent?: (event: OrderEvent) => void;
 ```
 
 ---
 
-## 9. 测试
+## 11. Testing
 
-框架：**Vitest**
+**Framework: Vitest** *(Default — Jest or another Vitest-compatible framework may be substituted.)*
 
 ```typescript
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { UserRepository } from './UserRepository.js';
 
-describe('SessionManager', () => {
-  let workspaceDir: string;
-  let manager: SessionManager;
+describe('UserRepository', () => {
+  let outputDir: string;
+  let repo: UserRepository;
 
   beforeEach(async () => {
-    workspaceDir = await mkdtemp(join(tmpdir(), 'test-'));
-    manager = new SessionManager(workspaceDir);
+    outputDir = await mkdtemp(join(tmpdir(), 'test-'));
+    repo = new UserRepository(outputDir);
   });
 
   afterEach(async () => {
-    await rm(workspaceDir, { recursive: true, force: true });
+    await rm(outputDir, { recursive: true, force: true });
   });
 
-  describe('createSession', () => {
-    it('creates a session with UUID and JSONL file', async () => {
-      const entry = await manager.createSession('main');
-      expect(entry.sessionId).toBeDefined();
+  describe('createUser', () => {
+    it('creates a user with a UUID and JSON record', async () => {
+      const entry = await repo.createUser('alice');
+      expect(entry.userId).toBeDefined();
     });
   });
 });
 ```
 
-规则：
-- 临时目录用 `mkdtemp()`，`afterEach` 清理
-- `describe` 按功能分组，`it` 描述具体行为
-- 每个测试独立，不共享可变状态
-- Mock 对象内联创建
+*(Rule)*
+- Use `mkdtemp()` for temporary directories; clean up in `afterEach`.
+- Group by feature with `describe`; describe behavior with `it`.
+- Keep each test independent; do not share mutable state.
+- Create mocks inline within the test file (in `it` or `beforeEach`); avoid shared mock factories across test files.
 
 ---
 
-## 10. 其他约定
+## 12. Other Conventions
 
-| 约定 | 说明 |
-|------|------|
-| 文件编码 | UTF-8，文件读写显式指定 `'utf-8'` |
-| 模块系统 | ES Modules（`"type": "module"`） |
-| TypeScript | `strict: true`，ES2022 target |
-| 日志 | 不用第三方日志库，用事件发射（`this.emit()`）或 `warn` 回调 |
-| 平台 | `process.platform` 检测，避免硬编码路径分隔符 |
-| 内存状态 | 用 `Map` 管理（如 `Map<string, TranscriptState>`） |
+| Convention | Notes | Tier |
+|------------|-------|------|
+| File encoding | UTF-8; pass `'utf-8'` explicitly on read/write | Rule |
+| Module system | ES Modules (`"type": "module"`) | Rule |
+| TypeScript `strict` | `strict: true` | Rule |
+| TypeScript `target` | Pick the newest ECMAScript version compatible with your minimum runtime (Node LTS or browser baseline) | Default |
+| Logging | Centralize logging behind a single module; keep call sites decoupled from the library choice | Guidance |
+| Platform | Detect via `process.platform`; avoid hard-coded path separators | Rule |
+| In-memory state | Prefer `Map` over plain objects for keyed collections (e.g., `Map<string, CacheEntry>`) | Default |
