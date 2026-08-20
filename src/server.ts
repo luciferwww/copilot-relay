@@ -4,6 +4,7 @@ import type { AppConfig } from './config.js';
 import { ensureCopilotToken, type AuthState } from './auth/copilot.js';
 import * as openaiTr from './translate/openai.js';
 import * as anthropicTr from './translate/anthropic.js';
+import * as responsesTr from './translate/responses.js';
 import { buildCopilotBaseHeaders } from './translate/shared.js';
 import { logger } from './logger.js';
 
@@ -12,7 +13,7 @@ export interface ServerHandle {
   close(): Promise<void>;
 }
 
-type Translator = typeof openaiTr;
+type Translator = typeof openaiTr | typeof anthropicTr | typeof responsesTr;
 
 export async function startServer(cfg: AppConfig): Promise<ServerHandle> {
   const server = http.createServer((req, res) => {
@@ -39,11 +40,11 @@ export async function startServer(cfg: AppConfig): Promise<ServerHandle> {
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(cfg.port, '127.0.0.1', () => resolve());
+    server.listen(cfg.port, cfg.host, () => resolve());
   });
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : cfg.port;
-  logger.info(`copilot-relay listening on http://127.0.0.1:${port}`);
+  logger.info(`copilot-relay listening on http://${cfg.host}:${port}`);
   return {
     port,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
@@ -76,6 +77,13 @@ async function handleRequest(
 
   if (method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {
     await proxy(req, res, cfg, openaiTr);
+    return;
+  }
+
+  if (method === 'POST' && path === '/v1/responses') {
+    // Spec §2.x — OpenAI Responses API. Models like gpt-5.x are only served
+    // via `<copilotApiBase>/responses`; upstream rejects them on chat/completions.
+    await proxy(req, res, cfg, responsesTr);
     return;
   }
 

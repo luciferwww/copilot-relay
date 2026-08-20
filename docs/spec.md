@@ -41,13 +41,14 @@ Behavior common to every command:
 - `auth valid` is `no` when the last refresh attempt failed (e.g., long-lived `access_token` revoked); otherwise `yes`.
 - Exit code is always 0.
 
-### 1.4 `copilot-relay start [--port N] [--log-level L]`
+### 1.4 `copilot-relay start [--host H] [--port N] [--log-level L]`
 
 - **Arguments**
+  - `-H, --host <host>`: overrides `config.host`. Default (`127.0.0.1`) means loopback-only; use e.g. `0.0.0.0` to expose on all interfaces — see the security note in NFR7.
   - `-p, --port <int>`: overrides `config.port`.
   - `-l, --log-level <debug|info|warn|error>`: overrides `config.logLevel`.
 - **Preconditions:** `auth.json` exists (otherwise exit 1 with message `Not logged in.`).
-- **Behavior:** run in the foreground, listening on `127.0.0.1:<port>`; on `SIGINT`/`SIGTERM`, close the server, delete the pid file, and `exit 0`. Writes [server.pid](#6-serverpid).
+- **Behavior:** run in the foreground, listening on `<config.host>:<port>`; on `SIGINT`/`SIGTERM`, close the server, delete the pid file, and `exit 0`. Writes [server.pid](#6-serverpid).
 
 ### 1.5 `copilot-relay stop`
 
@@ -84,7 +85,7 @@ Behavior common to every command:
 
 ## 2. HTTP Route Contracts
 
-The server binds `127.0.0.1:<port>` (never `0.0.0.0`). `host` has no user-facing configuration hook (no override via `config.json`, environment variable, or CLI flag); it is a code-level constant only.
+The server binds `<host>:<port>`, where `host` defaults to `127.0.0.1` (loopback-only). The default is overridable via `config.json`'s `host` field or the `start --host` flag; changing it to `0.0.0.0` exposes the proxy to the LAN (see NFR7 for the security rationale).
 
 ### 2.1 `GET /health`
 
@@ -94,8 +95,8 @@ The server binds `127.0.0.1:<port>` (never `0.0.0.0`). `host` has no user-facing
 
 - The request is proxied to `GET <copilotApiBase>/models` using the headers in §7.2 (excluding `Content-Type`, since GET has no body).
 - Upstream 2xx: pass the body through to the client verbatim (shape is dictated by Copilot; typically `{ "object": "list", "data": [...] }`).
-- Upstream non-2xx / upstream 401: handled per §2.6 / §2.7 (error shape uses the OpenAI classification; upstream 401 triggers one force-refresh + retry).
-- Client disconnect: abort the upstream per §2.9.
+- Upstream non-2xx / upstream 401: handled per §2.7 / §2.8 (error shape uses the OpenAI classification; upstream 401 triggers one force-refresh + retry).
+- Client disconnect: abort the upstream per §2.10.
 
 > [!NOTE]
 > Earlier v0.1 implementations returned a hard-coded 4-item list, which caused clients to show falsely-available models (e.g., `claude-3.5-sonnet`) in their pickers and then be rejected by upstream on `POST /v1/chat/completions`. Proxying keeps the list in sync with the subscription's actual endpoint (personal / enterprise) and removes the need for manual backfill.
@@ -107,20 +108,29 @@ The server binds `127.0.0.1:<port>` (never `0.0.0.0`). `host` has no user-facing
 - The request body is passed through to `<copilotApiBase>/chat/completions`.
 - Upstream request headers: see §5.
 - Supports `stream: true` (SSE); the response is piped through `Readable.fromWeb` without buffering.
-- **Upstream non-2xx handling** — the upstream body must not be proxied verbatim. Rewrite to the OpenAI shape per §2.6 / §2.7.
+- **Upstream non-2xx handling** — the upstream body must not be proxied verbatim. Rewrite to the OpenAI shape per §2.7 / §2.8.
 
-### 2.4 `POST /v1/messages`
+### 2.4 `POST /v1/responses`
+
+- The request body is passed through to `<copilotApiBase>/responses`.
+- Supports `stream: true`; the response (SSE `response.*` events) is piped through `Readable.fromWeb` without buffering.
+- **Why this route exists:** Copilot serves newer models (e.g. `gpt-5.6-luna`, `gpt-5.5`, `grok-4.5`) **only** via `/responses` — upstream rejects them on `/chat/completions` with `400 invalid_request_error`. See the `supported_endpoints` field from `GET /v1/models`.
+- Forwarded headers match §7.2 (OpenAI path: `Content-Type`, `Openai-Intent`, plus `Accept` when present inbound).
+- **Upstream non-2xx handling** — rewrite to the Responses error shape per §2.7 / §2.8.
+- Note: some models also advertise `ws:/responses` (WebSocket transport). v0.1 proxies the HTTP POST path only; WebSocket transport is unsupported (route falls through to §2.6 → 404).
+
+### 2.5 `POST /v1/messages`
 
 - The request body is passed through to `<copilotApiBase>/v1/messages`.
 - Forwarded headers additionally include `anthropic-version` (defaulting to `2023-06-01` if absent inbound) and `anthropic-beta` (if present inbound).
 - Otherwise the behavior matches §2.3.
 
-### 2.5 Unmatched Routes
+### 2.6 Unmatched Routes
 
 - Response: `404 application/json`, body
   `{"error": {"message": "No route for <METHOD> <PATH>"}}`.
 
-### 2.6 Error Response Shapes (FR5)
+### 2.7 Error Response Shapes (FR5)
 
 Upstream Copilot non-2xx responses and locally-thrown exceptions are rewritten to the target route's protocol shape:
 
@@ -128,6 +138,12 @@ Upstream Copilot non-2xx responses and locally-thrown exceptions are rewritten t
 
   ```json
   { "error": { "type": "<class>", "message": "<...>", "code": "<upstream-code | null>" } }
+  ```
+
+- OpenAI Responses endpoint (`/v1/responses`) — per OpenAI `ErrorResponse`:
+
+  ```json
+  { "error": { "code": "<upstream-code | null>", "message": "<...>", "param": null, "type": "<class>" } }
   ```
 
 - Anthropic endpoint (`/v1/messages`):
@@ -141,17 +157,17 @@ HTTP status code:
 
 `type` values follow the OpenAI error taxonomy: `invalid_request_error` / `authentication_error` / `permission_error` / `rate_limit_error` / `api_error`; fall back to `api_error` when uncertain. The same set is used for the Anthropic endpoint's `error.type`.
 
-Unmatched routes (§2.5) also use a simplified OpenAI shape with `404`.
+Unmatched routes (§2.6) also use a simplified OpenAI shape with `404`.
 
-### 2.7 Upstream 401 Retry Contract (FR3 + FR5)
+### 2.8 Upstream 401 Retry Contract (FR3 + FR5)
 
 1. After the proxy sends a request to Copilot, if upstream returns `401` (and the proxy has not yet written the first response byte to the client):
    - Call `ensureCopilotToken({ force: true })` to force-refresh the Copilot token;
    - Retry the same upstream request once, using the new token.
-2. If the retry still returns `401`, rewrite it per §2.6 and pass the 401 back to the client; also log a stdout hint to re-run `copilot-relay login`.
+2. If the retry still returns `401`, rewrite it per §2.7 and pass the 401 back to the client; also log a stdout hint to re-run `copilot-relay login`.
 3. If the refresh itself fails (e.g., the long-lived `access_token` has been revoked), the current request responds with `401`. Only `lastRefreshError` is written to `auth.json`; the previously stored Copilot token fields (`copilotToken`, `copilotExpiresAt`, `copilotApiBase`) are left as-is. Subsequent `copilot-relay status` calls will report `auth valid: no`.
 
-### 2.8 Mid-Stream Termination Sequence (FR6)
+### 2.9 Mid-Stream Termination Sequence (FR6)
 
 When the upstream errors mid-SSE, write a single error frame in the target protocol, then close the stream. Byte-level format:
 
@@ -165,6 +181,14 @@ When the upstream errors mid-SSE, write a single error frame in the target proto
 
   then call `res.end()`. **Do not emit `data: [DONE]`** — SDKs treat `[DONE]` as normal completion and would swallow the error.
 
+- **OpenAI Responses endpoint** — write one OpenAI `ErrorEvent` frame (event `error`, `data` is the bare `Error` object, per §2.7 shape):
+
+  ```
+  event: error\ndata: {"code":"<...>","message":"<...>","param":null,"type":"<class>"}\n\n
+  ```
+
+  then call `res.end()`.
+
 - **Anthropic endpoint** — write
 
   ```
@@ -173,7 +197,7 @@ When the upstream errors mid-SSE, write a single error frame in the target proto
 
   then call `res.end()`.
 
-### 2.9 Client Disconnect (FR6)
+### 2.10 Client Disconnect (FR6)
 
 - Listen on `req.on("close")`. If the upstream `fetch` has not yet completed, call the corresponding `AbortController.abort()` to avoid wasting Copilot quota.
 - Once the full response has been sent, the `close` event triggers no additional action.
@@ -210,13 +234,13 @@ Refresh policy: refresh when `copilotExpiresAt * 1000 - Date.now() ≤ 5 * 60 * 
 ```typescript
 interface AppConfig {
   port: number;                    // default: 5000
+  host: string;                    // default: "127.0.0.1"; override e.g. "0.0.0.0" to bind all interfaces (see NFR7)
   logLevel: 'debug'|'info'|'warn'|'error';  // default: "info"
   githubClientId: string;          // default: "Iv1.b507a08c87ecfe98" (community OSS default; see requirement A2)
   editorVersion: string;           // default: "vscode/1.98.0"
   editorPluginVersion: string;     // default: "copilot-chat/0.20.0"
   copilotIntegrationId: string;    // default: "vscode-chat"
   userAgent: string;               // default: "GitHubCopilotChat/0.20.0"
-  // intentionally no 'host' field: loopback-only; see requirement NFR7 / design §7.
 }
 ```
 
@@ -263,6 +287,8 @@ Missing fields fall back to defaults; malformed JSON is treated as an empty file
 | `anthropic-version` | Inherited from inbound, or `2023-06-01` (Anthropic path only) |
 | `anthropic-beta` | Inherited from inbound, optional (Anthropic path only) |
 | `Accept` | Inherited from inbound `Accept` if present |
+
+> The OpenAI path splits into two upstream URLs: `/chat/completions` (§2.3) and `/responses` (§2.4). Both use the header set above, including `Openai-Intent: conversation-panel`. The Anthropic path is `<copilotApiBase>/v1/messages` (§2.5).
 
 ## 8. GitHub Device-Code Parameters
 
@@ -316,7 +342,7 @@ function isAuthValid(state: AuthState | null): boolean;
   - If `opts?.force !== true` and the state does not yet meet the §4 refresh condition (i.e., remaining lifetime > 5 minutes), return the cached state.
   - Otherwise, exchange a new Copilot token per §7.1, `saveAuth`, and return the updated state.
   - On exchange failure (any non-2xx from `GET copilot_internal/v2/token`, network error, timeout, upstream 5xx, revoked `access_token`, etc.), throw `Error` with a message of the form `Copilot token exchange failed: <status> <body>`. Only `lastRefreshError` is written to `auth.json`; the previously stored Copilot token fields (`copilotToken`, `copilotExpiresAt`, `copilotApiBase`) are left as-is, so subsequent `isAuthValid` calls return `false`.
-  - v0.1 does not distinguish transient failures (network, upstream 5xx, rate limit) from permanent ones (revoked). Callers (`server.ts`, §11.3) treat any throw from `ensureCopilotToken` uniformly as an auth failure — respond `401` per §2.6 and hint at `copilot-relay login`. Finer-grained error classification is a v0.2+ improvement.
+  - v0.1 does not distinguish transient failures (network, upstream 5xx, rate limit) from permanent ones (revoked). Callers (`server.ts`, §11.3) treat any throw from `ensureCopilotToken` uniformly as an auth failure — respond `401` per §2.7 and hint at `copilot-relay login`. Finer-grained error classification is a v0.2+ improvement.
 - `loadAuth`: returns `null` (never throws) if the file is missing or the JSON is malformed.
 - `saveAuth`: writes `auth.json`. On Unix-like systems, `chmod 0600`. On Windows, no `icacls` call (§3).
 - `clearAuth`: deletes `auth.json`; silent if the file does not exist.
@@ -348,14 +374,14 @@ function handleRequest(
 ): Promise<void>;
 ```
 
-- The request-dispatch entry point. Catches all exceptions and writes responses in the shape from §2.6.
-- When `res.headersSent === true`: if the response is streaming, write the termination frame per §2.8 then call `res.end()`; otherwise, only log the error and write nothing further.
-- Upstream 401 handling is defined in §2.7; client-disconnect handling in §2.9.
-- Internally calls `ensureCopilotToken(cfg)`; failures are surfaced per §2.6.
+- The request-dispatch entry point. Catches all exceptions and writes responses in the shape from §2.7.
+- When `res.headersSent === true`: if the response is streaming, write the termination frame per §2.9 then call `res.end()`; otherwise, only log the error and write nothing further.
+- Upstream 401 handling is defined in §2.8; client-disconnect handling in §2.10.
+- Internally calls `ensureCopilotToken(cfg)`; failures are surfaced per §2.7.
 
-### 11.4 `translate/{openai,anthropic}.ts`
+### 11.4 `translate/{openai,anthropic,responses}.ts`
 
-Both translators export the same symbols (identical signatures, protocol-specific behavior):
+All three translators export the same symbols (identical signatures, protocol-specific behavior):
 
 ```typescript
 interface UpstreamRequest {
@@ -370,21 +396,22 @@ function buildUpstreamRequest(
 ): UpstreamRequest;
 
 function formatError(
-  errClass: string,   // A string from the OpenAI classification allowed by §2.6
+  errClass: string,   // A string from the OpenAI classification allowed by §2.7
   message: string,
   code?: string | null
-): object;             // Returns the JSON body shape from §2.6 for the respective protocol
+): object;             // Returns the JSON body shape from §2.7 for the respective protocol
                        // (OpenAI: `{error: {type, message, code}}`;
+                       //  Responses: `{error: {code, message, param, type}}` (param always null);
                        //  Anthropic: `{type: "error", error: {type, message}}`).
                        // Not JSON-stringified.
 
 function writeStreamErrorFrame(
   res: http.ServerResponse,
   err: { class: string; message: string; code?: string | null }
-): void;                // Writes the byte-level format from §2.8; internally calls res.end()
+): void;                // Writes the byte-level format from §2.9; internally calls res.end()
 ```
 
-- `buildUpstreamRequest`: assembles the URL and headers only; does not initiate `fetch`. Header set per §7.2.
+- `buildUpstreamRequest`: assembles the URL and headers only; does not initiate `fetch`. Header set per §7.2. The Responses translator targets `<copilotApiBase>/responses`; the OpenAI translator targets `/chat/completions`; the Anthropic translator targets `/v1/messages`.
 - `formatError`: returns the JSON body object.
 - `writeStreamErrorFrame`: idempotent — after the first call, `res.writableEnded` is true and subsequent calls return immediately.
 

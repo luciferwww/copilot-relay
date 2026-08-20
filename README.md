@@ -81,7 +81,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | `copilot-relay login` | GitHub device-code flow; stores tokens under `~/.copilot-relay/` |
 | `copilot-relay logout` | Delete stored credentials |
 | `copilot-relay status` | Show current config + token state |
-| `copilot-relay start [--port N] [--log-level L]` | Start proxy in foreground |
+| `copilot-relay start [--host H] [--port N] [--log-level L]` | Start proxy in foreground (default host 127.0.0.1) |
 | `copilot-relay stop` | Send SIGTERM to a foreground server via pid file |
 | `copilot-relay configure claude` | Write `~/.claude/settings.json` to point Claude Code at this proxy |
 | `copilot-relay configure codex` | (v0.2) Write Codex CLI settings |
@@ -92,6 +92,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | Route | Description |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
+| `POST /v1/responses` | OpenAI Responses API (streams supported; required for gpt-5.x models) |
 | `POST /v1/messages` | Anthropic messages API |
 | `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
@@ -102,6 +103,7 @@ Stored at `~/.copilot-relay/config.json`. Missing keys fall back to defaults def
 
 Notable fields:
 
+- `host` — bind address, default `127.0.0.1`. Set to `0.0.0.0` to expose the proxy on all interfaces (LAN access; see the caveats below).
 - `githubClientId` — OAuth client id used for device flow. Default is a well-known community value; override with your own OAuth App id if desired.
 - `editorVersion`, `editorPluginVersion`, `copilotIntegrationId`, `userAgent` — headers sent to `api.githubcopilot.com`. Adjust if Copilot backend rejects the request.
 

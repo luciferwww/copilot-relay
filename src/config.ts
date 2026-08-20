@@ -10,6 +10,7 @@ export const PID_FILE = join(DATA_DIR, 'server.pid');
 
 export interface AppConfig {
   port: number;
+  host: string;
   logLevel: LogLevel;
   githubClientId: string;
   editorVersion: string;
@@ -20,6 +21,7 @@ export interface AppConfig {
 
 export const DEFAULT_CONFIG: AppConfig = {
   port: 5000,
+  host: '127.0.0.1',
   logLevel: 'info',
   // Well-known community client_id used by open-source Copilot integrations
   // (copilot.vim, neovim copilot.lua, etc.). Override in config.json if you

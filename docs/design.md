@@ -50,7 +50,8 @@ flowchart LR
 | HTTP Server | [src/server.ts](../src/server.ts) | Route dispatch, request-body reading, streaming pipeline, error wrapping |
 | Copilot Auth | [src/auth/copilot.ts](../src/auth/copilot.ts) | Copilot token exchange / refresh / expiry check / persistence |
 | Device Code | [src/auth/deviceCode.ts](../src/auth/deviceCode.ts) | GitHub OAuth device-code flow |
-| OpenAI translator | [src/translate/openai.ts](../src/translate/openai.ts) | Builds upstream URL + request headers |
+| OpenAI translator | [src/translate/openai.ts](../src/translate/openai.ts) | Builds upstream URL + request headers for `/chat/completions` |
+| Responses translator | [src/translate/responses.ts](../src/translate/responses.ts) | Same, for `/responses` (OpenAI Responses API) |
 | Anthropic translator | [src/translate/anthropic.ts](../src/translate/anthropic.ts) | Same, Anthropic variant |
 
 ## 3. Key Flows
@@ -132,7 +133,7 @@ sequenceDiagram
 | Language | TypeScript + `tsc` compile | ts-node / bun | Zero runtime loader; `node dist/*.js` runs directly |
 | Module system | ESM (`"type":"module"`) | CJS | `open@10` is ESM-only, forcing the whole package to be ESM |
 | HTTP client | Built-in `fetch` (undici) | axios / node-fetch | Zero dependencies + native streams |
-| HTTP server | Built-in `node:http` | express / fastify | Only 3 routes; hand-rolled dispatch is actually clearer |
+| HTTP server | Built-in `node:http` | express / fastify | Only 5 routes; hand-rolled dispatch is actually clearer |
 | CLI parsing | `commander` | Hand-rolled argv parsing | Auto-generated `--help` and subcommand tree; saves ~120 LOC of hand-rolled parsing |
 | Open browser | `open` | Hand-rolled `spawn` | Cross-platform edge cases (macOS `open` / Linux `xdg-open` / Windows `start`) are easy to get wrong |
 | Logging | Home-grown stdout logger | pino / winston | Only 4 levels; ~10 lines of code |
@@ -158,8 +159,10 @@ Maps one-to-one to requirement FR3 / FR5 / FR6.
 
 **Do not proxy Copilot's raw error body verbatim.** Rewrite to the target route's protocol:
 
-- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) →
+- OpenAI endpoints (`/v1/chat/completions`, `/chat/completions`, `/v1/models`) →
   `{ error: { type, message, code } }`
+- OpenAI Responses endpoint (`/v1/responses`) →
+  `{ error: { code, message, param, type } }` (`param` always `null`)
 - Anthropic endpoint (`/v1/messages`) →
   `{ type: "error", error: { type, message } }`
 
@@ -177,14 +180,15 @@ Pass the upstream HTTP status through where possible; when unclassifiable or whe
 - **Client disconnect:** listen on `req.on("close")` and cancel the upstream `fetch` via `AbortController`, so Copilot quota is not wasted.
 - **Error mid-SSE:**
   - OpenAI endpoint: write `data: {"error": {...}}\n\n` then `res.end()`. **Do not emit `data: [DONE]`** — the SDK treats `[DONE]` as success and would swallow the error.
+  - OpenAI Responses endpoint: write `event: error\ndata: {"code":...,"message":...,"param":null,"type":...}\n\n` then `res.end()`.
   - Anthropic endpoint: write `event: error\ndata: {...}\n\n` then `res.end()`.
-- These sequences assume the `openai` and `@anthropic-ai/sdk` clients treat `data: {"error": {...}}` (without a trailing `[DONE]`) as a stream error rather than success. Re-verify this invariant when upgrading either dependency.
+- These sequences assume the `openai` and `@anthropic-ai/sdk` clients treat `data: {"error": {...}}` (without a trailing `[DONE]`) and `event: error` frames as stream errors rather than success. Re-verify this invariant when upgrading either dependency.
 
 ## 7. Security
 
 - **Tokens never appear in logs**: even at debug level, only the first 8 characters are printed.
 - **`auth.json` chmod 0600**: applied on Unix-like systems. On Windows no `icacls` call is made — permission relies on the `%USERPROFILE%` directory's own ACL.
-- **Listen on 127.0.0.1 only**: never bind `0.0.0.0`, to prevent LAN clients from using someone else's token. The bind address **has no user-facing configuration hook** — no config.json field, no env var, no CLI flag — only a code change (matches requirement NFR7).
+- **Listen on 127.0.0.1 by default**: never bind `0.0.0.0` unless the user opts in, to prevent LAN clients from using someone else's token. `config.host` / `start --host` allow override (e.g. `0.0.0.0`) for users who explicitly want LAN access; the loopback default remains the safe baseline (matches requirement NFR7).
 - **No CORS**: the proxy serves local developer tooling; the browser scenario is out of scope.
 
 ## 8. Extension Points

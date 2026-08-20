@@ -52,13 +52,14 @@ This project provides a **standalone, VS Code-independent** local CLI proxy so a
 | `copilot-relay configure claude` | ✅ |
 | `copilot-relay configure codex` | ⏳ v0.2 |
 
-> Default listen port is `5000`, overridable with `--port`. The listen address is fixed at `127.0.0.1` (see NFR7).
+> Default listen port is `5000`, overridable with `--port`. The listen host defaults to `127.0.0.1`, overridable with `--host` or the `host` config field (see NFR7).
 
 ### FR2. HTTP Routes
 
 | Route | Required |
 |---|---|
 | `POST /v1/chat/completions` (OpenAI; streaming supported) | ✅ |
+| `POST /v1/responses` (OpenAI Responses API; streaming supported) | ✅ |
 | `POST /v1/messages` (Anthropic; streaming supported) | ✅ |
 | `GET /v1/models` (proxied from upstream) | ✅ |
 | `GET /health` | ✅ |
@@ -80,8 +81,10 @@ This project provides a **standalone, VS Code-independent** local CLI proxy so a
 
 Errors returned by upstream Copilot must be rewritten to match the client's protocol shape:
 
-- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) return
+- OpenAI endpoints (`/v1/chat/completions`, `/chat/completions`, `/v1/models`) return
   `{ error: { type, message, code } }`.
+- OpenAI Responses endpoint (`/v1/responses`) returns
+  `{ error: { code, message, param, type } }` (`param` always `null`).
 - Anthropic endpoint (`/v1/messages`) returns
   `{ type: "error", error: { type, message } }`.
 
@@ -94,6 +97,7 @@ Pass the upstream HTTP status through where possible; when unclassifiable, use `
 - When the client disconnects, the proxy must abort the upstream request (to avoid wasting Copilot quota).
 - If the upstream errors mid-stream, terminate the response per the client protocol:
   - OpenAI: emit a `data: {"error": {...}}\n\n` chunk then close the stream. **Do not emit `data: [DONE]`** — SDKs treat `[DONE]` as normal completion and would swallow the error.
+  - OpenAI Responses: emit an `event: error\ndata: {"code":...,"message":...,"param":null,"type":...}\n\n` frame then close the stream.
   - Anthropic: emit `event: error\ndata: {"type":"error","error":{...}}\n\n` then close the stream.
 - The termination sequences above must produce observable errors in the `openai` and `@anthropic-ai/sdk` clients — the error must not be silently swallowed as a normal end-of-stream.
 
@@ -105,7 +109,7 @@ Pass the upstream HTTP status through where possible; when unclassifiable, use `
 - **NFR4 — Proxy overhead:** The proxy layer must not buffer streaming responses and must not perform extra data copying. No specific time-to-first-byte threshold is defined for v0.1.
 - **NFR5 — Security & logging:** `auth.json` has restrictive permissions; tokens must never appear in logs (even at `--log-level debug`, only the first 8 characters are printed). Logs go to stdout only — no file, no rotation.
 - **NFR6 — Portability:** 100% TypeScript. A single `tsc` build produces artifacts runnable via `node dist/cli.js`; no loader or bundler is used.
-- **NFR7 — Bind address:** Listen on `127.0.0.1` only. `0.0.0.0` and external IPs are not supported; other hosts on the same LAN must be unable to connect. `host` is not exposed as a configurable field (no override via `config.json`, environment variable, or CLI flag). LAN access is out of scope for v0.1; fork the project if needed.
+- **NFR7 — Bind address:** Default to `127.0.0.1` only — no LAN exposure out of the box, so other hosts cannot use someone's token. The default is overridable via `config.json`'s `host` field or the `start --host` flag so users can bind `0.0.0.0` (or a specific interface) when they explicitly want LAN access; anyone doing so accepts that the proxy exposes the Copilot token to whoever can reach it. There is no inbound authentication or TLS (§N5); LAN use is not recommended.
 
 ## 7. Constraints and Assumptions
 

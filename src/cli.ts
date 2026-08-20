@@ -25,10 +25,12 @@ program
   .command('start')
   .description('Start the proxy server in the foreground.')
   .option('-p, --port <port>', 'Port to listen on', (v) => parseInt(v, 10))
+  .option('-H, --host <host>', 'Address to bind (default: 127.0.0.1)')
   .option('-l, --log-level <level>', 'debug|info|warn|error')
-  .action(async (opts: { port?: number; logLevel?: LogLevel }) => {
+  .action(async (opts: { port?: number; host?: string; logLevel?: LogLevel }) => {
     const cfg = loadConfig();
     if (opts.port) cfg.port = opts.port;
+    if (opts.host) cfg.host = opts.host;
     if (opts.logLevel) cfg.logLevel = opts.logLevel;
     setLevel(cfg.logLevel);
     if (!loadAuth()) {
