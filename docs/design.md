@@ -1,6 +1,6 @@
-# copilot-relay — Design (v0.1)
+# copilot-relay — Design (v0.2)
 
-> Aligned with [requirement.md](./requirement.md); when the two conflict, `requirement.md` wins.
+> Status: draft, awaiting design approval. Aligned with the approved [requirement.md](./requirement.md); when the two conflict, `requirement.md` wins.
 
 > [!NOTE]
 > Diagrams in this document use Mermaid syntax. Open the preview pane in VS Code (`Ctrl+Shift+V` or the button in the top-right) to view them rendered; the `bierner.markdown-mermaid` extension is required (installed in this workspace). GitHub renders Mermaid natively — no extra setup.
@@ -16,7 +16,14 @@ flowchart LR
     subgraph Proxy[copilot-relay local process]
         B[HTTP Server<br/>node:http]
         C[Auth Manager<br/>ensureCopilotToken]
-        D[Header Builders<br/>translate/*]
+        D[Copilot Transport<br/>attempts + auth + abort]
+        I[Live Model Catalog<br/>cache + validation]
+        J[Messages Route Planner]
+        L[Responses Request Mapper]
+        M[Responses Output Mapper]
+        N[Responses SSE Translator]
+        O[Continuation Registry<br/>bounded in-memory state]
+        P[Safe Output Boundary<br/>allowlisted diagnostics]
         K[Config<br/>src/config.ts]
         E[(auth.json)]
         F[(config.json)]
@@ -28,13 +35,28 @@ flowchart LR
     end
 
     A -->|OpenAI/Anthropic format| B
-    B --> C
+    B --> J
+    J --> I
+    I --> D
+    J -->|Messages passthrough| D
+    J -->|Responses translation| L
+    L <--> O
+    L --> D
+    D --> C
     C -- read/write --> E
     C -- refresh on expiry --> H
-    B --> D
-    B -->|Bearer + Copilot headers| G
-    G -->|SSE stream| B
-    B -->|SSE stream passthrough| A
+    D -->|Bearer + Copilot headers| G
+    G -->|JSON or SSE| D
+    D -->|passthrough| B
+    D --> M
+    D --> N
+    M --> O
+    N --> O
+    M --> B
+    N --> B
+    B --> P
+    C --> P
+    B --> A
     F -.-> K
     K -.-> B
     K -.-> C
@@ -46,12 +68,20 @@ flowchart LR
 |---|---|---|
 | CLI frontend | [src/cli.ts](../src/cli.ts) | commander parsing, process lifecycle, pid file |
 | Config | [src/config.ts](../src/config.ts) | Default config + `config.json` read/write, path constants |
-| Logger | [src/logger.ts](../src/logger.ts) | Leveled logging, writes to stdout only (no file, no rotation) |
-| HTTP Server | [src/server.ts](../src/server.ts) | Route dispatch, request-body reading, streaming pipeline, error wrapping |
+| Logger / safe output | [src/logger.ts](../src/logger.ts) | Leveled structured logging and safe diagnostic rendering; accepts allowlisted fields rather than arbitrary objects or raw errors; writes to stdout only |
+| HTTP Server | [src/server.ts](../src/server.ts) | Route dispatch, client disconnect handling, protocol response selection |
 | Copilot Auth | [src/auth/copilot.ts](../src/auth/copilot.ts) | Copilot token exchange / refresh / expiry check / persistence |
 | Device Code | [src/auth/deviceCode.ts](../src/auth/deviceCode.ts) | GitHub OAuth device-code flow |
-| OpenAI translator | [src/translate/openai.ts](../src/translate/openai.ts) | Builds upstream URL + request headers |
-| Anthropic translator | [src/translate/anthropic.ts](../src/translate/anthropic.ts) | Same, Anthropic variant |
+| Copilot transport | `src/upstream/CopilotTransport.ts` | Authenticated attempt execution, request-scoped retry bounds, abort propagation, common headers |
+| Model catalog | `src/models/ModelCatalog.ts` | Fetches and validates live `/models` metadata; bounded cache and shared refresh |
+| Messages route planner | `src/routing/messages-route.ts` | Selects passthrough, Responses translation, or a typed local error without changing model id |
+| OpenAI translator | [src/translate/openai.ts](../src/translate/openai.ts) | Chat Completions passthrough headers and OpenAI error shape |
+| Anthropic translator | [src/translate/anthropic.ts](../src/translate/anthropic.ts) | Messages passthrough headers and Anthropic error/SSE shape |
+| Responses request mapper | `src/translate/responses/request-mapper.ts` | Pure validated Anthropic Messages → Responses JSON mapping |
+| Responses output mapper | `src/translate/responses/response-mapper.ts` | Pure non-streaming Responses → Anthropic Message mapping |
+| Responses SSE translator | `src/translate/responses/SseTranslator.ts` | Incremental SSE parsing and Anthropic event sequencing |
+| Continuation registry | `src/translate/responses/ContinuationRegistry.ts` | Bounded in-memory association between emitted Anthropic tool ids and authoritative completed Responses items needed for a following tool-result turn |
+| Translation types | `src/translate/responses/types.ts` | Boundary types, mapping results, stream state, typed translation errors |
 
 ## 3. Key Flows
 
@@ -125,6 +155,92 @@ sequenceDiagram
     end
 ```
 
+### 3.3 Capability-routed Anthropic request
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Anthropic client
+    participant S as HTTP Server
+    participant R as Messages Route Planner
+    participant M as Model Catalog
+    participant T as Copilot Transport
+    participant U as Copilot API
+    participant X as Responses Translator
+
+    C->>S: POST /v1/messages
+    S->>S: parse JSON and validate model
+    S->>R: plan(request)
+    R->>M: get(model id)
+    alt catalog empty or model missing
+        M->>T: GET /models
+        T->>U: authenticated request
+        U-->>T: live model metadata
+        T-->>M: response
+        M-->>R: validated model record
+    else fresh or bounded-stale cache available
+        M-->>R: cached model record
+    end
+    alt advertises /v1/messages
+        R-->>S: passthrough plan
+        S->>T: original body → /v1/messages
+        T-->>S: upstream bytes
+        S-->>C: byte-for-byte body passthrough
+    else advertises /responses and translator exists
+        R-->>S: responses plan
+        S->>X: validate and map complete request
+        X-->>S: Responses request or typed 400
+        S->>T: mapped body → /responses
+        T-->>S: JSON or Responses SSE
+        S->>X: map output incrementally when streaming
+        X-->>C: Anthropic Message or SSE events
+    else metadata malformed
+        R-->>C: Anthropic 502 api_error
+    else no implemented route
+        R-->>C: Anthropic 400 invalid_request_error
+    end
+```
+
+The planner is deterministic and side-effect free after catalog lookup. Endpoint priority is `/v1/messages`, then HTTP `/responses`; `ws:/responses` is not an HTTP capability. No branch substitutes the requested model.
+
+### 3.4 Translation stream lifecycle
+
+The translation path validates and maps the complete inbound JSON body before opening `/responses`. After any successful upstream response body or downstream response begins, it never retries or switches routes; pre-body failures follow the restricted attempt-coordinator rules in §7.
+
+For non-streaming calls, the output mapper reads one bounded JSON response and emits one Anthropic Message. For streaming calls, the SSE translator consumes arbitrary byte chunks, buffers only an incomplete SSE frame and bounded per-tool argument state, and emits Anthropic events as soon as their required source data is available.
+
+```mermaid
+stateDiagram-v2
+    [*] --> AwaitCreated
+    AwaitCreated --> Active: response.created
+    Active --> Active: valid per-item event
+    Active --> Completed: response.completed and every item done
+    AwaitCreated --> Failed: any other protocol event / EOF
+    Active --> Failed: error / invalid transition / EOF
+    Completed --> [*]
+    Failed --> [*]
+```
+
+The translator requires one valid `response.created` before emitting `message_start`; it does not synthesize response identity or model metadata from later events. The exact initial-usage representation is defined from the probed `response.created` shape in `spec.md`, and a missing required field is a 502 protocol failure.
+
+The global response state owns Anthropic content-block indexes and a bounded item map keyed by both `output_index` and `item_id`. Each item has an independent type-specific state for added, content/argument deltas, and done. Either key resolving to a different existing item, a delta before add, a duplicate terminal event, or `response.completed` while any item is incomplete is a 502 protocol failure. Events for different items may interleave only in sequences explicitly admitted by the FR9 fixtures and `spec.md`; the item map preserves deterministic Anthropic block ordering without requiring one global `ContentOpen` item.
+
+The state machine guarantees exactly one `message_start`, ordered start/delta/stop events for each block, one terminal `message_delta`, and one `message_stop` on success. A failure emits one Anthropic `error` event and closes without a success terminator.
+
+### 3.5 Tool-use continuation
+
+The selected v0.2 strategy is **local stateless replay**, not reliance on an upstream stored conversation. Responses requests use `store: false`, do not use `previous_response_id`, and explicitly send the completed prior items required by the verified Copilot contract. FR9 must verify these controls and the required encrypted-reasoning request fields; if Copilot cannot support this mode, the design must be revised rather than silently switching to upstream conversation storage.
+
+When a Responses result contains one or more function calls, the mapper emits relay-generated opaque Anthropic `tool_use.id` values. Completed output items are first collected in a request-local staging group: for a stream, data from `response.output_item.added` or deltas remains provisional until the corresponding `response.output_item.done` event, and an item-level done does not publish registry state. Non-streaming output requires a fully validated `status: completed`; streaming output requires a valid `response.completed` after every staged item is done.
+
+After upstream completion and successful translation, publication capacity is checked before any client-visible success commit. For non-streaming output, the registry atomically publishes immediately before writing the complete Anthropic response. For streaming output, publication occurs after every corresponding `tool_use` block has been written successfully and immediately before the Anthropic success terminator. Failure, malformed events, premature EOF, abort, or client disconnect before that commit point discards the staging group. A disconnect after publication does not roll the group back because the client may already have received the tool ids. Capacity failure is therefore a translation failure, never a partial publication or a successful response containing unusable tool ids.
+
+The published group contains the model id, each external tool id and upstream `call_id`, completed function-call items, and any completed reasoning items or encrypted reasoning content needed for replay. Multiple parallel tool calls from one response point to the same response group so a later request can validate and replay the group coherently.
+
+On a following request, every `tool_result.tool_use_id` must resolve to one unexpired published group, match the requested model and historical tool-use block, and map to exactly one upstream `function_call_output.call_id`. Missing, expired, duplicated, cross-model, or cross-group references fail with Anthropic 400 before transport. Published groups are immutable and may be read repeatedly until eviction; they are not reserved or consumed by one request because Anthropic clients resend complete history, retries may replay it, and conversations may branch. Preventing duplicate model execution is an independent request-idempotency concern and is not inferred from continuation lookup.
+
+Entries are process-local, size- and age-bounded, never persisted, and evicted deterministically; exact limits and replay rules belong in `spec.md`. A process restart therefore makes outstanding tool continuations explicitly unavailable rather than reconstructing hidden state from names or text.
+
 ## 4. Technical Choices & Tradeoffs
 
 | Decision | Choice | Alternatives | Rationale |
@@ -135,26 +251,104 @@ sequenceDiagram
 | HTTP server | Built-in `node:http` | express / fastify | Only 3 routes; hand-rolled dispatch is actually clearer |
 | CLI parsing | `commander` | Hand-rolled argv parsing | Auto-generated `--help` and subcommand tree; saves ~120 LOC of hand-rolled parsing |
 | Open browser | `open` | Hand-rolled `spawn` | Cross-platform edge cases (macOS `open` / Linux `xdg-open` / Windows `start`) are easy to get wrong |
-| Logging | Home-grown stdout logger | pino / winston | Only 4 levels; ~10 lines of code |
+| Logging | Structured safe-output boundary over stdout | Free-form logger / pino / winston | A small allowlisted schema prevents credential-bearing objects and raw errors from reaching output surfaces |
 | Config | JSON | TOML / YAML | No external parser needed; `JSON.stringify` is built in |
+| Capability source | Live Copilot `/models` only | Static model table / name heuristics | Honors account-specific and changing upstream capabilities |
+| Routing | Explicit route plan | Endpoint trial-and-error | Deterministic errors; client requests never become capability probes |
+| Translation model | Direct Messages ↔ Responses mappers | General canonical protocol | v0.2 has one conversion pair; avoids a premature abstraction |
+| SSE parsing | Incremental state machine | Buffer full response / regex replacement | Preserves time-to-first-event and handles arbitrary transport chunking |
+| Mapper shape | Pure functions + typed errors | Translation inside HTTP handler | Enables exhaustive fixture tests without sockets or credentials |
 
-## 5. Directory Layout
+## 5. Model Catalog and Routing
+
+### 5.1 Source of truth
+
+The live Copilot `/models` response is the sole runtime authority. `1.json` and other captures are test fixtures only and are never loaded by production code. Routing uses only exact entries from `supported_endpoints`; feature preflight uses explicit values from `capabilities.supports` and required bounds from `capabilities.limits`. Model id, family, vendor, picker state, and preview state are not capability signals.
+
+Effective support is the intersection of upstream metadata and relay implementation. For example, a model declaring vision is insufficient until the selected translation path implements and validates image mapping.
+
+### 5.2 Cache state
+
+`ModelCatalog` keeps one immutable validated snapshot with a monotonically increasing generation, its fetch time, a generation-scoped negative-result map, and at most one in-progress refresh promise. Cache limits and deadlines are constants specified in `spec.md`; they are not user configuration in v0.2.
+
+| State | Behavior |
+|---|---|
+| Fresh snapshot | Resolve without network access |
+| Empty cache | Refresh with a deadline; concurrent callers await the same promise |
+| Model absent | Reuse a negative result only for `(modelId, currentGeneration)`; otherwise force one shared refresh and record absence against the resulting generation |
+| Refresh fails with bounded-stale snapshot | Use stale snapshot and log only age/status metadata |
+| Refresh fails without usable snapshot | Return Anthropic 502 |
+| Response exceeds byte, record-count, or validated-cache limits | Abort the refresh; use bounded-stale data or return Anthropic 502 |
+| Required metadata malformed | Return Anthropic 502; do not infer or probe |
+| Verified pre-execution endpoint rejection | Invalidate, refresh, and re-plan once through the request attempt coordinator |
+
+The cache stores the complete model records needed for endpoint and feature decisions. It does not mutate or enrich records with guessed defaults. Parsing uses a bounded body reader before JSON decoding, and a candidate snapshot is published atomically only after the complete response passes schema, record-count, and aggregate-size validation. A failed refresh never replaces a usable snapshot. Publishing a new generation atomically clears all earlier negative results. A request finding a refresh already in progress awaits that same promise before testing or recording its model-specific result. Normal snapshot expiry still triggers refresh, so a generation-scoped negative result cannot hide a newly published catalog indefinitely.
+
+### 5.3 Route plans
+
+The planner returns a discriminated union rather than performing network I/O:
+
+- `messages-passthrough`: original bytes and Anthropic headers go to `/v1/messages`;
+- `responses-translation`: validated mapping is required before `/responses` is called;
+- `client-error`: known model/request with no supported implemented route, HTTP 400;
+- `upstream-metadata-error`: missing or malformed required metadata, HTTP 502.
+
+This union is the boundary that prevents fallback from becoming model substitution or endpoint guessing.
+
+## 6. Translation Pipeline
+
+### 6.1 Request validation
+
+The request mapper parses unknown JSON into boundary types and applies the closed mapping matrix defined in `spec.md`. Each field and content-block variant has one disposition: exact mapping, documented transformation, or rejection. Validation completes before any upstream `/responses` call.
+
+Validation combines protocol rules with the selected model record. Unsupported semantics such as non-empty `stop_sequences`, `top_k`, and `tool_result.is_error: true` produce typed `invalid_request_error` results. Base64 images receive local declared-media-type, encoding, encoded-size, count, and vision-capability checks without decoding. URL images receive only HTTP(S) syntax, count, and vision-capability checks; the relay never resolves or fetches them, so actual resource type, size, accessibility, and validity are delegated to upstream.
+
+When tool results are present, validation resolves the continuation group before constructing Responses input. The mapper replays the authoritative completed function-call and reasoning items followed by `function_call_output` items keyed by the stored `call_id`; client-visible assistant text alone is not treated as a substitute for opaque Responses state.
+
+### 6.2 Non-streaming output
+
+The output mapper accepts only observed and documented Copilot Responses shapes. It maps text, function calls, usage, and completion reason into one Anthropic Message. Unknown output item types or structurally invalid payloads produce an Anthropic 502 because the upstream contract, not the client request, was violated.
+
+### 6.3 Streaming output
+
+The SSE translator has two layers:
+
+1. A transport parser converts arbitrary UTF-8 byte chunks into complete SSE events while preserving split code points and multi-line `data` fields.
+2. A protocol state machine converts documented Responses events into ordered Anthropic events and accumulates only bounded tool-argument fragments until the relevant content block closes.
+
+Unknown ignorable transport fields may be ignored only when `spec.md` explicitly permits them. Unknown Responses event types, invalid transitions, malformed JSON, excessive buffered state, and premature EOF are upstream protocol failures and terminate with an Anthropic stream error.
+
+## 7. Transport Boundary
+
+`CopilotTransport` centralizes behavior currently embedded in `server.proxy()` and `proxyModels()`: proactive token acquisition, common headers, execution of an attempt plan, request deadlines, abort propagation, and returning the upstream `Response` before client headers are committed. It does not parse provider payloads or choose routes.
+
+One request-scoped attempt coordinator owns both retry reasons and records `authRetryUsed`, `replanUsed`, the auth generation, catalog generation, route, and terminal state for every upstream attempt. No retry is allowed after downstream output starts. Before output starts, an upstream 401 may consume the one auth retry; a capability re-plan may consume the one re-plan only for an exact HTTP status or machine-readable code that FR9 has verified means rejection before model execution. Timeout, connection reset, premature EOF, and ambiguous 5xx responses are terminal and never replayed.
+
+Each retry reason may be consumed at most once, and an attempt may transition to only one next attempt. The original call plus at most one auth retry and one verified endpoint re-plan gives a hard maximum of three upstream attempts regardless of ordering. A repeated reason or any unclassified failure terminates the coordinator. “No downstream bytes” is therefore necessary but not sufficient for replay.
+
+Passthrough success responses remain streamed byte-for-byte. Translation handlers copy only safe response headers and set the client protocol content type themselves. Body readers enforce byte limits while reading rather than after allocation. Translated streams propagate downstream backpressure to the upstream reader; they do not continue accumulating translated events while `ServerResponse.write()` is blocked.
+
+## 8. Directory Layout
 
 See project root [README.md](../README.md) and [spec.md](./spec.md) §3.
 
-## 6. Error Handling Strategy
+## 9. Error Handling Strategy
 
 Maps one-to-one to requirement FR3 / FR5 / FR6.
 
-### 6.1 Layer responsibilities
+### 9.1 Layer responsibilities
 
 | Layer | Strategy |
 |---|---|
-| CLI | Top-level `.catch(err => { logger.error(err); exit(1); })`; subcommands may throw freely |
-| HTTP handler | `handleRequest(...).catch(...)`; if headers are not yet written, respond in the client's protocol shape (see §6.2) |
+| CLI | Top-level catch converts a typed failure to a safe diagnostic code/message; it never passes an arbitrary `Error` or cause chain to the logger |
+| HTTP handler | Selects the client protocol error formatter and renders only typed safe diagnostics, never raw thrown-error text |
 | Auth | When `loadAuth() → null`, the `start` command reports "please run login first" and `exit(1)` |
+| Model catalog / planner | Returns typed 400 or 502 failures; never writes an HTTP response directly |
+| Request mapper | Returns typed 400 failures for unsupported or invalid client semantics |
+| Output mapper / SSE translator | Returns or emits typed 502 failures for malformed upstream protocol |
+| Transport | Reports typed HTTP, timeout, network, and auth outcomes without raw bodies or choosing a client error shape |
 
-### 6.2 Upstream errors → client shape (FR5)
+### 9.2 Upstream errors → client shape (FR5)
 
 **Do not proxy Copilot's raw error body verbatim.** Rewrite to the target route's protocol:
 
@@ -165,37 +359,61 @@ Maps one-to-one to requirement FR3 / FR5 / FR6.
 
 Pass the upstream HTTP status through where possible; when unclassifiable or when the error originates locally, use `502`.
 
-### 6.3 401 and token refresh (FR3 + FR5)
+Local capability errors are classified before transport: unknown model, unsupported valid route, and unsupported request semantics are 400; unavailable or malformed required model metadata is 502. Upstream error bodies may be read only through the bounded body reader and parsed solely to recognize machine-readable error codes explicitly allowlisted in `spec.md`. Client and log messages are locally constructed from the failure phase, HTTP status, allowlisted code, and an allowlisted request-id header when present; arbitrary upstream message text is never returned or logged.
+
+### 9.3 401 and token refresh (FR3 + FR5)
 
 - **Proactive refresh:** `ensureCopilotToken` fetches a new token when the Copilot token's remaining lifetime is ≤ 5 minutes.
-- **Reactive refresh:** on upstream 401, force-refresh once and retry the original request (see the alt branch in §3.2). Retry is **only allowed before the first upstream response byte arrives**. If SSE forwarding has already begun, do not retry — terminate the stream per §6.4.
-- **Second 401:** pass through to the client using the shape from §6.2, and hint on stdout to re-run `copilot-relay login`.
-- **Refresh itself fails** (long-lived access_token revoked): the current request responds with **401** (not 500). Only `lastRefreshError` is written to `auth.json`; the previously stored Copilot token fields (`copilotToken`, `copilotExpiresAt`, `copilotApiBase`) are left as-is (see [spec.md §4](./spec.md#4-authjson-schema)). `copilot-relay status` then observes the expired token plus the failure marker and flags auth as invalid.
+- **Reactive refresh:** on upstream 401, force-refresh once and retry the original request (see the alt branch in §3.2). Retry is **only allowed before the first downstream response byte is written** and because the 401 establishes authentication rejection. If SSE forwarding has already begun, do not retry and terminate the stream per §9.4.
+- **Second 401:** pass through to the client using the shape from §9.2, and hint on stdout to re-run `copilot-relay login`.
+- **Definitive credential rejection:** a token-exchange status or documented error code that unambiguously means the long-lived access token is invalid maps to 401. Auth persistence records only a typed safe failure code and timestamp, leaves prior Copilot token fields as-is, and lets `status` report invalid auth without raw upstream text.
+- **Transient or malformed refresh failure:** timeout, network failure, upstream 5xx, malformed success payload, and unrecognized failures map to 502. They preserve the prior auth-validity state, do not write a permanent invalid marker, and do not prompt for login. Unknown cases default to this non-credential class; `spec.md` defines the exact classification table.
+- **Refresh concurrency:** the Auth Manager holds an immutable in-memory auth snapshot with a monotonically increasing generation and at most one refresh promise for a source generation. Proactive callers from the same generation join that promise. A reactive 401 records the generation of the token actually rejected: if a newer generation already exists, the request retries with it without another exchange; otherwise it starts or joins the refresh for the rejected generation.
+- **Generation-safe commit:** a refresh success, definitive rejection, or diagnostic state may commit only if its source generation is still current. Success atomically writes the new token state and advances the generation. A stale success or failure is discarded, so an older request cannot overwrite a newer token or mark it invalid. Transient failure never mutates persistent auth validity. Exact in-process initialization and persistence fields belong in `spec.md`.
 
-### 6.4 Request lifecycle (FR6)
+### 9.4 Request lifecycle (FR6)
 
-- **Client disconnect:** listen on `req.on("close")` and cancel the upstream `fetch` via `AbortController`, so Copilot quota is not wasted.
+- **Lifecycle owner:** each request has one owner that combines `req.aborted`, a premature downstream response `close`, and the applicable deadline into one upstream `AbortController`. A normal request-stream `close` after the body is read is not by itself treated as client cancellation.
+- **Backpressure:** passthrough uses stream piping; translation awaits downstream `drain` whenever `write()` returns false before reading and translating more upstream bytes.
+- **Single termination:** success, typed failure, timeout, upstream abort, and client disconnect race through one terminal state. Before headers, a local/upstream timeout returns the client protocol's 502 shape. After streaming starts, a timeout follows the mid-stream error rule when the socket remains writable. Client disconnect closes silently. No path writes an error after success or after socket closure.
+- **Cleanup:** completion removes request/response listeners, clears deadline timers, releases stream readers, and aborts unfinished upstream work exactly once.
 - **Error mid-SSE:**
   - OpenAI endpoint: write `data: {"error": {...}}\n\n` then `res.end()`. **Do not emit `data: [DONE]`** — the SDK treats `[DONE]` as success and would swallow the error.
   - Anthropic endpoint: write `event: error\ndata: {...}\n\n` then `res.end()`.
 - These sequences assume the `openai` and `@anthropic-ai/sdk` clients treat `data: {"error": {...}}` (without a trailing `[DONE]`) as a stream error rather than success. Re-verify this invariant when upgrading either dependency.
 
-## 7. Security
+## 10. Security
 
-- **Tokens never appear in logs**: even at debug level, only the first 8 characters are printed.
+- **Credentials never appear in output**: access tokens, Copilot tokens, authorization headers, image data, and credential substrings are excluded from logs, CLI output, client errors, and thrown-error messages at every log level. Status output includes only authentication state and expiry metadata.
+- **Safe values are constructed, not scrubbed after formatting**: auth, transport, and protocol layers return typed diagnostic codes plus allowlisted scalar metadata such as HTTP status, model id, cache age, and failure phase. Raw headers, bodies, request payloads, token-exchange payloads, `Error` objects, cause chains, and auth-state objects are not accepted by logger or client-error APIs.
+- **Defense-in-depth redaction**: the output boundary tracks current and replaced credential values and removes complete known values and authorization-header forms from any exceptional fallback string. This is not the primary guarantee: ordinary output paths never receive secret-derived text, so token prefixes and other value-derived fragments cannot be emitted. Persisted diagnostics use the same typed safe representation.
 - **`auth.json` chmod 0600**: applied on Unix-like systems. On Windows no `icacls` call is made — permission relies on the `%USERPROFILE%` directory's own ACL.
 - **Listen on 127.0.0.1 only**: never bind `0.0.0.0`, to prevent LAN clients from using someone else's token. The bind address **has no user-facing configuration hook** — no config.json field, no env var, no CLI flag — only a code change (matches requirement NFR7).
 - **No CORS**: the proxy serves local developer tooling; the browser scenario is out of scope.
+- **Bounded untrusted input**: request bodies, SSE frames, tool arguments, error bodies, and model metadata are subject to limits defined in `spec.md`; limits are checked before unbounded allocation or logging.
 
-## 8. Extension Points
+## 11. Extension Points
 
-Reserved but **not implemented in v0.1**:
+Reserved but **not implemented in v0.2**:
 
-- **Multiple backends:** `config.provider` field (v0.1 is hard-coded to copilot). Once new providers are added, `server.proxy()` dispatches to different translators by provider.
-- **Model routing:** the client's `model` field is currently passed through verbatim. A future `modelMap` config option can rewrite (e.g.) `gpt-4o` to the specific Copilot model slug.
-- **Rate limiting / audit:** middleware slot reserved (around `handleRequest`); not added in v0.1.
+- **Multiple backends:** `config.provider` remains Copilot-only. A future backend must provide its own transport and capability source rather than weakening the live-metadata contract.
+- **Additional protocol pairs:** Messages ↔ Chat Completions may be added as another explicit route-plan variant and closed mapping; v0.2 does not introduce a general canonical protocol.
+- **Additional transports:** `ws:/responses` may be implemented separately; its advertisement never activates the HTTP Responses path.
+- **Rate limiting / audit:** middleware slot reserved around request dispatch; not added in v0.2.
 
-## 9. Known Risks
+## 12. Test Strategy
+
+- Pure mapper fixtures cover every accepted and rejected row in the spec mapping matrix.
+- Continuation fixtures cover request-local staging, atomic publish only after response completion, discard before the commit point, repeated immutable lookup, non-streaming and streaming tool calls, completed reasoning-item capture, parallel calls, exact `call_id` reuse, expiry/eviction, restart loss, model mismatch, and cross-group rejection.
+- Model catalog tests use captured `/models` fixtures plus malformed variants; production code never imports those fixtures.
+- Route-planner table tests cover endpoint combinations, missing metadata, translator availability, and exact model-id preservation.
+- SSE tests partition identical event bytes at every boundary, combine multiple frames per chunk, split UTF-8 code points, interleave multiple output items according to the probed event table, and reject missing `response.created`, conflicting item keys, incomplete items at response completion, and every undocumented transition.
+- Transport tests use a local fake HTTP server to verify proactive auth, generation-scoped refresh single-flight and commit, stale-result rejection, one 401 retry, definitive-versus-transient refresh classification, exact pre-execution re-plan signals, rejection of ambiguous replay, the three-attempt bound, deadline abort, and no downstream bytes before retry decisions complete.
+- Lifecycle tests force downstream backpressure and race success, timeout, upstream failure, and client disconnect while asserting one terminal action and complete listener/timer cleanup.
+- End-to-end SDK tests verify observable success and error behavior through `@anthropic-ai/sdk`; live Copilot probes remain a separate acceptance gate and are recorded in `spec.md`.
+- Security tests inject sentinel credentials into auth and upstream failures, then assert that no complete value or substring appears in output surfaces.
+
+## 13. Known Risks
 
 | Risk | Impact | Mitigation |
 |---|---|---|
@@ -204,3 +422,10 @@ Reserved but **not implemented in v0.1**:
 | device-code `client_id` revoked | Login fails | Allow users to configure their own OAuth App id |
 | Windows chmod is a no-op | `auth.json` permissions relaxed | Documented; relies on the user profile directory ACL |
 | Default `githubClientId` compliance | GitHub may restrict third-party use | Users can substitute their own OAuth App |
+| `/models` metadata is missing or inconsistent | Valid models cannot be routed | One refresh, bounded-stale cache, explicit 502; never guess |
+| Concurrent auth refreshes complete out of order | New token or validity state is overwritten | Generation-scoped single-flight and compare-before-commit |
+| Copilot Responses differs from public OpenAI Responses | Translation fails or corrupts semantics | Live probes gate completion; observed shapes become spec fixtures |
+| Required Responses continuation state is unavailable or expires | A tool-result turn cannot continue | Bounded local registry, authoritative completed items, explicit 400; never guess or depend silently on upstream storage |
+| Unknown or reordered SSE events | Invalid Anthropic stream | Strict state machine, bounded buffers, fail closed with stream error |
+| Slow or disconnected downstream accumulates translated output | Memory growth and wasted quota | Backpressure-aware writes, deadlines, bounded parser state, unified abort cleanup |
+| Translation retry duplicates model execution | Duplicate model work or tool call | Retry only for 401 or probed pre-execution endpoint rejection; ambiguous failures are terminal; one coordinator caps total attempts |
