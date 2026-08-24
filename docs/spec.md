@@ -233,8 +233,9 @@ Fields or variants absent from these tables are Anthropic `400 invalid_request_e
 | `top_k` | Rejected when present |
 | `stop_sequences` | Absent or empty array; omitted upstream; non-empty rejected |
 | `metadata` | Absent or exactly `{user_id:string}`; copy that object to Responses `metadata` |
+| `output_config` | Absent or exactly `{effort:string}`; require the exact value in live `capabilities.supports.reasoning_effort`; map to Responses `reasoning:{effort}` |
 
-Every Responses request also sets `store:false`. `previous_response_id` is never sent. Non-default sampling values are rejected because the selected live Copilot Responses contract rejected them during FR9.
+Every Responses request also sets `store:false`. `previous_response_id` is never sent. Non-default sampling values are rejected because the selected live Copilot Responses contract rejected them during FR9. An absent `output_config` emits no `reasoning` field. A present `output_config` must contain exactly `effort`; `format`, extra keys, non-string values, and empty strings are rejected. If `reasoning_effort` is missing, not an array of strings, or otherwise malformed in live model metadata, return 502; if it is valid but omits the requested effort, return 400. Request-level reasoning effort does not permit Anthropic `thinking` or `redacted_thinking` content blocks.
 
 ### 7.2 Message content
 
@@ -428,17 +429,19 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 
 ### 12.1 Model metadata
 
-`gpt-5.6-luna` advertised exact endpoints `['/responses','ws:/responses']`. Relevant metadata included:
+`gpt-5.6-luna` and `gpt-5.6-sol` advertised exact endpoints `['/responses','ws:/responses']`. Relevant metadata included:
 
 - `supports.streaming`, `tool_calls`, `parallel_tool_calls`, and `vision`: `true`;
 - `limits.max_output_tokens`: `128000`;
 - `limits.vision.max_prompt_image_size`: `3145728`;
 - `limits.vision.max_prompt_images`: `1`;
 - supported image media types included JPEG, PNG, WebP, and GIF.
+- `gpt-5.6-sol` advertised `supports.reasoning_effort` as `['none','low','medium','high','xhigh','max']`.
 
 ### 12.2 Accepted behavior
 
 - Non-streaming and streaming text succeeded with `store:false`.
+- On `gpt-5.6-sol`, non-streaming and streaming requests with `reasoning:{effort:'medium'}` succeeded. The non-streaming output contained `reasoning` followed by `message`; the stream used the already-supported `response.output_item.added/done` reasoning events and introduced no reasoning-summary delta event.
 - `instructions` and assistant `output_text` history succeeded.
 - Explicit default sampling `temperature:1` and `top_p:0.98` succeeded; tested non-default values were rejected.
 - `max_output_tokens:15` was rejected; `16` was accepted and could return incomplete with reason `max_output_tokens`.
@@ -451,6 +454,7 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 - Opaque response ids differed across `response.created`, `response.in_progress`, and `response.completed` snapshots in a live stream; model identity remained stable. The relay therefore retains the created id for Anthropic output and validates later ids only as non-empty strings.
 - Opaque item ids also differed between added, delta, and done events for one output item; sequential `output_index` remained stable. The relay correlates stream item state by output index and treats each opaque item id as independently validated metadata.
 - Claude Code 2.1.39 removed top-level `dangerouslyDisableSandbox:false` and `run_in_background:false` from a Bash `tool_use` when echoing the executed call into the next Messages request. The emitted id, name, and remaining input were unchanged. Continuation validation therefore permits only omission of authoritative top-level `false` fields and still replays the stored completed item.
+- The official Claude Code VS Code extension 2.1.233 bundled runtime sent `output_config:{effort:'medium'}` when configured with `effortLevel:'medium'`; it did not send a top-level `thinking` field in that probe.
 
 Observed text stream order:
 
