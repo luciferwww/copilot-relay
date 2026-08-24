@@ -242,7 +242,7 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 |---|---|
 | User string or `text` block | User `input_text`; a block may additionally carry exact `cache_control:{type:'ephemeral'}`, which is validated and omitted upstream |
 | Assistant string or `text` block | Assistant `output_text`; the same exact ephemeral cache hint is validated and omitted upstream |
-| Assistant `tool_use` emitted by this relay | Resolve continuation; replay authoritative completed item, not client-provided `input`; the same exact ephemeral cache hint is validated and omitted upstream |
+| Assistant `tool_use` emitted by this relay | Resolve continuation; validate the historical input projection below; replay authoritative completed item, not client-provided `input`; the same exact ephemeral cache hint is validated and omitted upstream |
 | User `tool_result` with string/text content | `function_call_output` using stored `call_id`; the same exact ephemeral cache hint is validated and omitted upstream; output is concatenated text |
 | User base64 `image` block | `input_image` with data URL, §7.4 |
 
@@ -250,7 +250,7 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 
 The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
 
-For each represented group, every tool id must resolve to that unexpired group, match the exact requested model and historical assistant block, occur once in the request, and have exactly one result for every function call in the group. The mapper inserts the group's completed reasoning and function-call items once at its assistant position, then inserts the matching `function_call_output` items at the user result position. Missing results, a result before its tool use, mixed groups in one parallel call set, duplicated ids, cross-model references, or an unclosed group at end of history fail before transport with Anthropic 400.
+For each represented group, every tool id must resolve to that unexpired group, match the exact requested model and historical assistant block, occur once in the request, and have exactly one result for every function call in the group. The historical tool name must equal the authoritative name. Historical input keys must be a subset of the authoritative top-level keys; every retained value must be JSON-deep-equal, and every omitted authoritative value must be exactly `false`. Added keys, changed values, nested normalization, and omission of any other value fail before transport. This narrow projection accepts Claude Code's removal of explicit false defaults without treating client input as authoritative. The mapper inserts the group's original completed reasoning and function-call items once at its assistant position, then inserts the matching `function_call_output` items at the user result position. Missing results, a result before its tool use, mixed groups in one parallel call set, duplicated ids, cross-model references, or an unclosed group at end of history fail before transport with Anthropic 400.
 
 ### 7.3 Tools and tool choice
 
@@ -450,6 +450,7 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 - Streaming `response.created.response.usage` was `null`; terminal `response.completed.response.usage` contained actual input, output, and total tokens.
 - Opaque response ids differed across `response.created`, `response.in_progress`, and `response.completed` snapshots in a live stream; model identity remained stable. The relay therefore retains the created id for Anthropic output and validates later ids only as non-empty strings.
 - Opaque item ids also differed between added, delta, and done events for one output item; sequential `output_index` remained stable. The relay correlates stream item state by output index and treats each opaque item id as independently validated metadata.
+- Claude Code 2.1.39 removed top-level `dangerouslyDisableSandbox:false` and `run_in_background:false` from a Bash `tool_use` when echoing the executed call into the next Messages request. The emitted id, name, and remaining input were unchanged. Continuation validation therefore permits only omission of authoritative top-level `false` fields and still replays the stored completed item.
 
 Observed text stream order:
 
