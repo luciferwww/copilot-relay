@@ -1,6 +1,6 @@
 # copilot-relay — Specification (v0.2)
 
-> Status: draft, awaiting specification approval and production implementation. This document is the target contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
+> Status: approved 2026-08-24; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
 
 ## 1. Scope and invariants
 
@@ -191,7 +191,7 @@ An internal refresh reads a bounded `/models` response and validates `data` as a
 - `capabilities.supports` as an object when a requested feature needs it;
 - `capabilities.limits` and the exact required numeric/nested fields when a requested limit needs them.
 
-Unrelated metadata may be retained but is never a capability signal. A failed candidate never replaces the current snapshot. Publication increments generation and clears all earlier negative results.
+Records with a valid id but no `supported_endpoints` field are non-routable and are not stored; requesting one therefore follows the missing-metadata 502 path. A present but non-array `supported_endpoints`, a non-string endpoint element, or any other malformed stored field fails the complete candidate. Unrelated metadata may be retained but is never a capability signal. A failed candidate never replaces the current snapshot. Publication increments generation and clears all earlier negative results.
 
 ### 6.2 Lookup and refresh
 
@@ -226,13 +226,13 @@ Fields or variants absent from these tables are Anthropic `400 invalid_request_e
 | `max_tokens` | Required integer; `max_output_tokens`; must be at least 16 and no greater than metadata `limits.max_output_tokens` |
 | `system` | String or text-block array joined with `\n\n`; `instructions` |
 | `stream` | Boolean; copied; default `false` |
-| `tools` | Map by §7.3; requires tool capability |
+| `tools` | Absent or empty array means no tools; non-empty array maps by §7.3 and requires tool capability |
 | `tool_choice` | Map by §7.3 |
 | `temperature` | Absent or exactly `1`; explicit `1` maps to `temperature:1` |
 | `top_p` | Absent or exactly `0.98`; explicit `0.98` maps to `top_p:0.98` |
 | `top_k` | Rejected when present |
 | `stop_sequences` | Absent or empty array; omitted upstream; non-empty rejected |
-| `metadata` | Rejected; not forwarded |
+| `metadata` | Absent or exactly `{user_id:string}`; copy that object to Responses `metadata` |
 
 Every Responses request also sets `store:false`. `previous_response_id` is never sent. Non-default sampling values are rejected because the selected live Copilot Responses contract rejected them during FR9.
 
@@ -240,13 +240,13 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 
 | Anthropic input | Responses input |
 |---|---|
-| User string or `text` block | User `input_text` |
-| Assistant string or `text` block | Assistant `output_text` |
-| Assistant `tool_use` emitted by this relay | Resolve continuation; replay authoritative completed item, not client-provided `input` |
-| User `tool_result` with string/text content | `function_call_output` using stored `call_id`; output is concatenated text |
+| User string or `text` block | User `input_text`; a block may additionally carry exact `cache_control:{type:'ephemeral'}`, which is validated and omitted upstream |
+| Assistant string or `text` block | Assistant `output_text`; the same exact ephemeral cache hint is validated and omitted upstream |
+| Assistant `tool_use` emitted by this relay | Resolve continuation; replay authoritative completed item, not client-provided `input`; the same exact ephemeral cache hint is validated and omitted upstream |
+| User `tool_result` with string/text content | `function_call_output` using stored `call_id`; the same exact ephemeral cache hint is validated and omitted upstream; output is concatenated text |
 | User base64 `image` block | `input_image` with data URL, §7.4 |
 
-`tool_result.is_error` may be absent or `false`; `true` is rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
+`tool_result.is_error` may be absent or `false`; `true` is rejected. The only accepted `cache_control` value is exactly `{type:'ephemeral'}` on a `text`, `tool_use`, or `tool_result` block; it is a documented lossy cache hint with no verified Responses equivalent. Extra cache-control keys, other types, and cache hints on other block variants are rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
 
 The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
 
@@ -254,7 +254,7 @@ For each represented group, every tool id must resolve to that unexpired group, 
 
 ### 7.3 Tools and tool choice
 
-Anthropic tool `{name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
+An absent or empty Anthropic tools array produces no Responses tool fields; `tool_choice` remains invalid without a non-empty tools array. Each entry of a non-empty array `{name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
 
 | Anthropic `tool_choice.type` | Responses `tool_choice` |
 |---|---|
@@ -378,7 +378,7 @@ Copilot FR9 streams contained no `[DONE]`. `[DONE]` before a valid terminal even
 | `response.incomplete` | Require every item done, reason `max_output_tokens`, usage, and no observed function call; discard any non-call stage and emit terminal success with `max_tokens`. If any function call was added or completed, emit a 502 stream error and no success terminator |
 | `response.failed`, `error` | Emit one Anthropic error and close without success terminator |
 
-Duplicate events, delta-before-add, conflicting `item_id`/`output_index`, multiple open content parts, done-before-required-done, unknown item/event types, response identity changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
+Duplicate events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, unknown item/event types, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
 
 ### 10.3 Anthropic event bytes and usage
 
@@ -448,6 +448,8 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 - Multiple function-call items were observed completing sequentially by output index, not interleaving.
 - A real PNG base64 data URL succeeded. External URL images returned `400 invalid_request_body` with a safe diagnostic that external image URLs are unsupported.
 - Streaming `response.created.response.usage` was `null`; terminal `response.completed.response.usage` contained actual input, output, and total tokens.
+- Opaque response ids differed across `response.created`, `response.in_progress`, and `response.completed` snapshots in a live stream; model identity remained stable. The relay therefore retains the created id for Anthropic output and validates later ids only as non-empty strings.
+- Opaque item ids also differed between added, delta, and done events for one output item; sequential `output_index` remained stable. The relay correlates stream item state by output index and treats each opaque item id as independently validated metadata.
 
 Observed text stream order:
 
