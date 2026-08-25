@@ -2,11 +2,12 @@
 
 Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible** APIs, backed by GitHub Copilot. Lets tools like Claude Code, Codex CLI, etc. reuse your Copilot subscription.
 
-> Status: v0.1 skeleton. Copilot backend only. Codex configuration is a stub.
+> Status: v0.2. Claude Code can use Copilot models that expose either native
+> Anthropic Messages or HTTP OpenAI Responses. Codex configuration remains a stub.
 
 ## Prerequisites
 
-- **Node.js ≥ 18** (native `fetch` and `Readable.fromWeb` are required).
+- **Node.js ≥ 18** (native `fetch` and Web Streams are required).
 - **Git** for cloning.
 - **Microsoft-internal note**: this repo ships an [.npmrc](.npmrc) pointing at
   `https://packagefeedproxy.microsoft.io/npm/` so `npm install` works from the
@@ -50,7 +51,9 @@ copilot-relay configure claude          # writes ~/.claude/settings.json
 ```
 
 Fire up `claude` and it will route through the proxy to your Copilot
-subscription. The proxy prints a request log line per hit at `--log-level debug`.
+subscription. For each exact requested model, the relay reads the live Copilot
+model catalog, prefers native `/v1/messages`, and otherwise uses the implemented
+HTTP `/responses` translation path. It never substitutes a different model.
 
 ### Changing the port
 
@@ -84,7 +87,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | `copilot-relay start [--port N] [--log-level L]` | Start proxy in foreground |
 | `copilot-relay stop` | Send SIGTERM to a foreground server via pid file |
 | `copilot-relay configure claude` | Write `~/.claude/settings.json` to point Claude Code at this proxy |
-| `copilot-relay configure codex` | (v0.2) Write Codex CLI settings |
+| `copilot-relay configure codex` | Unimplemented; exits with code `2` |
 | `copilot-relay config-show` | Print resolved config |
 
 ## Routes served
@@ -92,7 +95,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | Route | Description |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
-| `POST /v1/messages` | Anthropic messages API |
+| `POST /v1/messages` | Capability-routed native Messages or Responses translation |
 | `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
 

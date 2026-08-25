@@ -37,7 +37,8 @@ These are code constants, not v0.2 configuration fields.
 | `MODEL_CATALOG_TIMEOUT_MS` | 15 seconds | One internal catalog refresh |
 | `EXTERNAL_MODELS_TIMEOUT_MS` | 30 seconds | Client-facing `/v1/models` passthrough |
 | `MODEL_INVOCATION_TIMEOUT_MS` | 10 minutes | One generation request including retries |
-| `CONTINUATION_TTL_MS` | 15 minutes | Published continuation group lifetime |
+| `CONTINUATION_TTL_MS` | 24 hours | Continuation group idle lifetime, renewed by successful lookup |
+| `CONTINUATION_ABSOLUTE_TTL_MS` | 7 days | Maximum continuation group lifetime regardless of activity |
 | `CONTINUATION_MAX_GROUPS` | 256 | Published groups per process |
 | `CONTINUATION_GROUP_MAX_BYTES` | 2 MiB | Serialized items in one group |
 | `CONTINUATION_TOTAL_MAX_BYTES` | 32 MiB | Serialized items across all groups |
@@ -176,7 +177,7 @@ One generation request has `authRetryUsed`, `replanUsed`, auth generation, catal
 
 1. Execute the planned invocation.
 2. Before downstream output, HTTP 401 may consume the single auth retry and invoke again with the refreshed/current generation.
-3. Before downstream output, only HTTP 400 with parsed `error.code === "unsupported_api_for_model"` may consume the single re-plan: invalidate the catalog, refresh, resolve the same model id, and invoke the new exact plan.
+3. Before downstream output, only HTTP 400 with parsed `error.code === "unsupported_api_for_model"` may consume the single re-plan: invalidate the catalog, require a newly published generation without stale fallback, resolve the same model id, and invoke the new exact plan.
 4. Each reason is consumed at most once. The original plus both distinct retries yields at most three model invocations.
 5. Plain 400, timeout, reset, premature EOF, malformed error body, 5xx, repeated reason, or any failure after downstream output is terminal.
 
@@ -193,14 +194,15 @@ An internal refresh reads a bounded `/models` response and validates `data` as a
 - `capabilities.supports` as an object when a requested feature needs it;
 - `capabilities.limits` and the exact required numeric/nested fields when a requested limit needs them.
 
-Records with a valid id but no `supported_endpoints` field are non-routable and are not stored; requesting one therefore follows the missing-metadata 502 path. A present but non-array `supported_endpoints`, a non-string endpoint element, or any other malformed stored field fails the complete candidate. Unrelated metadata may be retained but is never a capability signal. A failed candidate never replaces the current snapshot. Publication increments generation and clears all earlier negative results.
+Records with a valid id but no `supported_endpoints` field are retained in a generation-scoped invalid-id set rather than the routable-record map; requesting one therefore follows the invalid-metadata 502 path, while an id absent from both collections is an unknown-model 400. A present but non-array `supported_endpoints`, a non-string endpoint element, or any other malformed stored field fails the complete candidate. Unrelated metadata may be retained but is never a capability signal. A failed candidate never replaces the current snapshot. Publication increments generation and clears all earlier negative results.
 
 ### 6.2 Lookup and refresh
 
 - A snapshot is fresh for 5 minutes.
 - Empty or expired cache starts or joins one manager-owned refresh.
 - A model miss may reuse only `(modelId, currentGeneration)`. Otherwise one refresh is attempted and the resulting miss is recorded for that generation.
-- Refresh failure may use an existing snapshot no older than 60 minutes. The safe log records only age and status.
+- Ordinary refresh failure may use an existing snapshot no older than 60 minutes. The safe log records only age and status.
+- Refresh forced by verified endpoint rejection must publish a generation newer than the rejected snapshot; failure returns Anthropic 502 without stale fallback.
 - Without bounded-stale data, refresh failure is Anthropic 502.
 - The catalog manager uses the same independent-waiter, last-waiter abort, one-terminal-section, and generation-safe commit rules as the Auth Manager.
 
@@ -247,10 +249,10 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 | Assistant string or `text` block | Assistant `output_text`; the same exact ephemeral cache hint is validated and omitted upstream |
 | System string or `text` block | System `input_text`, retained at the same message position; string content must be non-empty, while array content requires at least one text block; the same exact ephemeral cache hint is validated and omitted upstream |
 | Assistant `tool_use` emitted by this relay | Resolve continuation; validate the historical input projection below; replay authoritative completed item, not client-provided `input`; the same exact ephemeral cache hint is validated and omitted upstream |
-| User `tool_result` with string/text content | `function_call_output` using stored `call_id`; the same exact ephemeral cache hint is validated and omitted upstream; output is concatenated text |
+| User `tool_result` with string/text content | `function_call_output` using stored `call_id`; boolean `is_error` and the same exact ephemeral cache hint are validated and omitted upstream; output is concatenated text |
 | User base64 `image` block | `input_image` with data URL, §7.4 |
 
-System-role content must be either a non-empty string or a non-empty block array containing only text blocks. Empty strings, empty arrays, and every non-text block are rejected. Top-level `system` continues to map to Responses `instructions`, while a system-role message remains in its original input position. `tool_result.is_error` may be absent or `false`; `true` is rejected. The only accepted `cache_control` value is exactly `{type:'ephemeral'}` on a `text`, `tool_use`, or `tool_result` block; it is a documented lossy cache hint with no verified Responses equivalent. Extra cache-control keys, other types, and cache hints on other block variants are rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
+System-role content must be either a non-empty string or a non-empty block array containing only text blocks. Empty strings, empty arrays, and every non-text block are rejected. Top-level `system` continues to map to Responses `instructions`, while a system-role message remains in its original input position. `tool_result.is_error` may be absent, `false`, or `true`; when present it must be boolean and is omitted upstream because Responses has no equivalent error flag, while the result text is preserved. The only accepted `cache_control` value is exactly `{type:'ephemeral'}` on a `text`, `tool_use`, or `tool_result` block; it is a documented lossy cache hint with no verified Responses equivalent. Extra cache-control keys, other types, and cache hints on other block variants are rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
 
 The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
 
@@ -295,14 +297,16 @@ interface ContinuationGroup {
   groupId: string;
   modelId: string;
   createdAt: number;
+  lastAccessedAt: number;
   expiresAt: number;
+  absoluteExpiresAt: number;
   items: readonly CompletedContinuationItem[];
   calls: ReadonlyMap<string, { callId: string; outputIndex: number }>;
   byteSize: number;
 }
 ```
 
-Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction.
+Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity, capped by `absoluteExpiresAt`. Active conversations therefore survive ordinary pauses but cannot renew a group beyond `CONTINUATION_ABSOLUTE_TTL_MS`.
 
 ### 8.2 Staging and atomic publication
 
@@ -313,12 +317,29 @@ Each invocation owns an unpublished stage. A completed function-call item alloca
 1. Build a temporary live view and expiry-removal plan without mutating the registry.
 2. Against that live view, reject duplicate ids or malformed/empty staged calls.
 3. Compute the new group byte size from UTF-8 JSON serialization. If it exceeds `CONTINUATION_GROUP_MAX_BYTES`, throw without mutation.
-4. In the temporary eviction plan, order live existing groups by `createdAt` and then `groupId`, and select the oldest groups until adding the new group would satisfy both `CONTINUATION_MAX_GROUPS` and `CONTINUATION_TOTAL_MAX_BYTES`.
+4. In the temporary eviction plan, order live existing groups by `lastAccessedAt`, then `createdAt`, then `groupId`, and select the least recently used groups until adding the new group would satisfy both `CONTINUATION_MAX_GROUPS` and `CONTINUATION_TOTAL_MAX_BYTES`.
 5. In one critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state. Any failure before this step leaves the registry unchanged.
 
 For non-streaming output, publish occurs after complete validation and immediately before writing the Anthropic response. For streaming, it occurs after all tool blocks have been written and immediately before terminal `message_delta`. Failure or disconnect before publication discards the stage; disconnect after publication does not roll it back.
 
-Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, or id collision causes publication failure. Restart loses all groups and unresolved results return 400.
+Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, or id collision causes publication failure. Restart loses all groups and unresolved results return 400. Because the client-visible tool id does not contain the opaque upstream call state, a Claude Code conversation with unresolved or retained tool history must be restarted after the relay process restarts.
+
+### 8.3 Known restart limitation and future persistence contract
+
+The current v0.2 registry is intentionally process-local. Its restart failure is observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from the normalized Anthropic history. Unknown ids therefore remain a 400 rather than triggering heuristic reconstruction.
+
+A future persistence implementation must preserve finite statelessness across relay process replacement without changing the wire mapping. It must satisfy all of the following before replacing the current process-local contract:
+
+- persist only atomically published groups and atomically remove expired or evicted groups;
+- use a versioned, authenticated, encrypted-at-rest format whose key is not embedded in the continuation data;
+- retain the existing per-group, total-byte, group-count, model-match, and renewable idle-TTL bounds;
+- validate schema, version, authentication, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
+- fail closed and delete or quarantine corrupted, incompatible, undecryptable, expired, or oversized records without logging their contents;
+- never persist client message history beyond the authoritative Responses items and call metadata required for replay;
+- define atomic replacement, crash recovery, file locking, logout cleanup, and concurrent-process ownership before implementation;
+- prove with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
+
+Until that contract is implemented, restart resilience is not an acceptance property of v0.2 and clients must begin a new conversation after relay restart when retained tool history is present.
 
 ## 9. Non-streaming Responses mapping
 
@@ -418,9 +439,9 @@ Non-2xx bodies are read only to the 64-KiB bound and parsed only for allowlisted
 
 One request controller combines request abort, premature response close, and its route deadline. A normal inbound request-stream close after complete body receipt is not cancellation. Waiting for auth/catalog registers a waiter hook instead of passing this controller to shared work.
 
-Success, typed failure, timeout, abort, and disconnect race through one request terminal state. Cleanup removes listeners/timers, releases readers, and aborts unfinished request-owned work once. Client disconnect is silent.
+Success, typed failure, timeout, abort, and disconnect race through one request terminal state. Cleanup removes listeners/timers, cancels unfinished upstream response bodies before releasing their readers, and aborts unfinished request-owned work once. Client disconnect is silent.
 
-Translated streaming awaits downstream `drain` whenever `write()` returns false before reading another upstream chunk. It never buffers translated output behind backpressure.
+Translated streaming awaits downstream `drain` whenever `write()` returns false before reading another upstream chunk. The wait observes already-fired and subsequent request abort or response close and removes all listeners on its first terminal event. It never buffers translated output behind backpressure.
 
 ### 11.3 Mid-stream failure
 
