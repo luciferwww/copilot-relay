@@ -1,6 +1,8 @@
 # copilot-relay — Design (v0.2)
 
-> Status: approved 2026-08-24. Aligned with the approved [requirement.md](./requirement.md); when the two conflict, `requirement.md` wins.
+> Status: approved 2026-08-24; amended 2026-08-26. Aligned with the approved [requirement.md](./requirement.md); when the two conflict, `requirement.md` wins.
+
+> Follow-up design: [Native Responses v2](./native-responses-v2-design.md), originating from [@xlight](https://github.com/xlight)'s [PR #1](https://github.com/luciferwww/copilot-relay/pull/1), adapts native inbound `POST /v1/responses` to the post-PR #2 Messages-to-Responses architecture.
 
 > [!NOTE]
 > Diagrams in this document use Mermaid syntax. Open the preview pane in VS Code (`Ctrl+Shift+V` or the button in the top-right) to view them rendered; the `bierner.markdown-mermaid` extension is required (installed in this workspace). GitHub renders Mermaid natively — no extra setup.
@@ -36,6 +38,7 @@ flowchart LR
 
     A -->|OpenAI/Anthropic format| B
     B --> J
+    B -->|Native Responses capability check| I
     J --> I
     I --> D
     J -->|Messages passthrough| D
@@ -69,7 +72,7 @@ flowchart LR
 | CLI frontend | [src/cli.ts](../src/cli.ts) | commander parsing, process lifecycle, pid file |
 | Config | [src/config.ts](../src/config.ts) | Default config + `config.json` read/write, path constants |
 | Logger / safe output | [src/logger.ts](../src/logger.ts) | Leveled structured logging and safe diagnostic rendering; accepts allowlisted fields rather than arbitrary objects or raw errors; writes to stdout only |
-| HTTP Server | [src/server.ts](../src/server.ts) | Route dispatch, client disconnect handling, protocol response selection |
+| HTTP Server | `src/http-server.ts` | Route dispatch, native Responses handling, client disconnect handling, protocol response selection |
 | Copilot Auth | [src/auth/copilot.ts](../src/auth/copilot.ts) | Copilot token exchange / refresh / expiry check / persistence |
 | Device Code | [src/auth/deviceCode.ts](../src/auth/deviceCode.ts) | GitHub OAuth device-code flow |
 | Copilot transport | `src/upstream/CopilotTransport.ts` | Authenticated attempt execution, request-scoped retry bounds, abort propagation, common headers |
@@ -254,7 +257,7 @@ The future store must not turn continuation into a long-term conversation databa
 | Language | TypeScript + `tsc` compile | ts-node / bun | Zero runtime loader; `node dist/*.js` runs directly |
 | Module system | ESM (`"type":"module"`) | CJS | `open@10` is ESM-only, forcing the whole package to be ESM |
 | HTTP client | Built-in `fetch` (undici) | axios / node-fetch | Zero dependencies + native streams |
-| HTTP server | Built-in `node:http` | express / fastify | Only 3 routes; hand-rolled dispatch is actually clearer |
+| HTTP server | Built-in `node:http` | express / fastify | Small fixed route surface; explicit dispatch remains clearer |
 | CLI parsing | `commander` | Hand-rolled argv parsing | Auto-generated `--help` and subcommand tree; saves ~120 LOC of hand-rolled parsing |
 | Open browser | `open` | Hand-rolled `spawn` | Cross-platform edge cases (macOS `open` / Linux `xdg-open` / Windows `start`) are easy to get wrong |
 | Logging | Structured safe-output boundary over stdout | Free-form logger / pino / winston | A small allowlisted schema prevents credential-bearing objects and raw errors from reaching output surfaces |
@@ -283,9 +286,9 @@ Effective support is the intersection of upstream metadata and relay implementat
 | Empty cache | Start a manager-owned refresh with its own deadline; concurrent callers await the same promise as independent waiters |
 | Model absent | Reuse a negative result only for `(modelId, currentGeneration)`; otherwise force one shared refresh and record absence against the resulting generation |
 | Refresh fails with bounded-stale snapshot | Use stale snapshot and log only age/status metadata |
-| Refresh fails without usable snapshot | Return Anthropic 502 |
-| Response exceeds byte, record-count, or validated-cache limits | Abort the refresh; use bounded-stale data or return Anthropic 502 |
-| Required metadata malformed | Return Anthropic 502; do not infer or probe |
+| Refresh fails without usable snapshot | Return a 502 in the calling route's protocol shape |
+| Response exceeds byte, record-count, or validated-cache limits | Abort the refresh; use bounded-stale data or return a route-shaped 502 |
+| Required metadata malformed | Return a route-shaped 502; do not infer or probe |
 | Verified pre-execution endpoint rejection | Invalidate, require a new generation without stale fallback, and re-plan once through the request attempt coordinator |
 
 The cache stores the complete model records needed for endpoint and feature decisions. It does not mutate or enrich records with guessed defaults. Parsing uses a bounded body reader before JSON decoding, and a candidate snapshot is published atomically only after the complete response passes schema, record-count, and aggregate-size validation. A failed refresh never replaces a usable snapshot. Publishing a new generation atomically clears all earlier negative results. A request finding a refresh already in progress registers as a waiter and awaits that same promise before testing or recording its model-specific result. Client disconnect or request deadline removes only that waiter; it does not settle or reject the shared promise for other waiters. Because v0.2 has no background refresh, the manager aborts the operation when its own deadline expires or its waiter count reaches zero. Completion, last-waiter cancellation, abort, and generation publication race through one manager-owned terminal state so no result commits after cancellation. Normal snapshot expiry still triggers refresh, so a generation-scoped negative result cannot hide a newly published catalog indefinitely. Exact waiter bookkeeping and race rules belong in `spec.md`.
@@ -301,7 +304,13 @@ The planner returns a discriminated union rather than performing network I/O:
 
 This union is the boundary that prevents fallback from becoming model substitution or endpoint guessing.
 
-### 5.4 External models route
+### 5.4 Native Responses route
+
+Native inbound `POST /v1/responses` is handled beside, not inside, the Messages route planner. The HTTP handler resolves the exact model through `ModelCatalog`, requires exact HTTP `/responses`, and invokes that same endpoint through `CopilotTransport` with the original admitted body. Successful JSON and SSE use the OpenAI passthrough writer; Messages mappers and continuation state are not involved.
+
+The transport owns a pre-output 401 retry. The handler owns verified endpoint rejection: it recognizes only exact HTTP 400 code `unsupported_api_for_model`, invalidates the current catalog generation, requires one non-stale resolution of the same model, and retries `/responses` once only if it remains advertised. Unsupported valid models terminate with OpenAI 400; non-2xx upstream bodies are safely rewritten rather than passed through.
+
+### 5.5 External models route
 
 Client-facing `GET /v1/models` is an independent request-owned passthrough through `CopilotTransport`. On success it pipes the upstream body byte-for-byte; it never serializes a validated `ModelCatalog` snapshot. Client disconnect or request deadline aborts only this passthrough operation.
 
@@ -429,6 +438,7 @@ Reserved but **not implemented in v0.2**:
 - SSE tests partition identical event bytes at every boundary, combine multiple frames per chunk, split UTF-8 code points, interleave multiple output items according to the probed event table, and reject missing `response.created`, conflicting item keys, incomplete items at response completion, and every undocumented transition.
 - Transport tests use a local fake HTTP server to verify proactive auth, generation-scoped refresh single-flight and commit, per-waiter cancellation, independent manager deadlines, last-waiter abort, stale-result rejection, one 401 retry, definitive-versus-transient refresh classification, exact pre-execution re-plan signals, rejection of ambiguous replay, the three-model-invocation bound, deadline abort, and no downstream bytes before retry decisions complete.
 - Models-route tests verify that external `GET /v1/models` remains byte-for-byte request-owned passthrough, does not join or publish `ModelCatalog` state, and can run concurrently with an independent catalog refresh.
+- Native Responses route tests verify exact capability checks, successful request/JSON/SSE byte preservation, safe non-2xx rewriting, the single verified 400 re-plan, rejection of plain 400 replay, local 400 with no second invocation when refreshed metadata drops `/responses`, and isolation from Messages translation and continuation state.
 - Lifecycle tests force downstream backpressure and race success, timeout, upstream failure, and client disconnect while asserting one terminal action and complete listener/timer cleanup.
 - End-to-end SDK tests verify observable success and error behavior through `@anthropic-ai/sdk`; live Copilot probes remain a separate acceptance gate and are recorded in `spec.md`.
 - Security tests inject sentinel credentials into auth and upstream failures, then assert that no complete value or substring appears in output surfaces.

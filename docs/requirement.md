@@ -1,6 +1,6 @@
 # copilot-relay — Requirements (v0.2)
 
-> Status: approved 2026-08-21; amended 2026-08-21. v0.1 behavior remains supported unless this document explicitly changes it.
+> Status: approved 2026-08-21; amended 2026-08-26. v0.1 behavior remains supported unless this document explicitly changes it.
 
 ## 1. Background
 
@@ -17,7 +17,7 @@ v0.1 forwards each client protocol to the matching Copilot endpoint. This fails 
 
 ## 2. Goals
 
-- **G1.** Provide a local HTTP service exposing OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`) APIs, backed by GitHub Copilot.
+- **G1.** Provide a local HTTP service exposing OpenAI-compatible (`/v1/chat/completions`, `/v1/responses`) and Anthropic-compatible (`/v1/messages`) APIs, backed by GitHub Copilot.
 - **G2.** Run independently of VS Code: no dependency on the `vscode` module or the Copilot Chat extension. Pure Node.js CLI.
 - **G3.** Support streaming responses (SSE).
 - **G4.** Support the GitHub device-code login flow; own and auto-refresh the short-lived Copilot token.
@@ -52,6 +52,7 @@ A future release must provide finite statelessness at the process boundary: sess
 - **US5.** I want `copilot-relay status` to quickly show the current auth state and token expiry.
 - **US6.** As a Claude Code user, I want to select a Copilot model that supports `/responses` and use it without changing Claude Code's Anthropic API configuration.
 - **US7.** As a user, I want unsupported content or model capabilities to fail explicitly instead of being silently dropped or routed to a different model.
+- **US8.** As an OpenAI Responses client, I want to call a Copilot model through native `/v1/responses` without protocol translation.
 
 ## 5. Functional Requirements
 
@@ -75,6 +76,7 @@ A future release must provide finite statelessness at the process boundary: sess
 | Route | Required |
 |---|---|
 | `POST /v1/chat/completions` (OpenAI; streaming supported) | ✅ |
+| `POST /v1/responses` (OpenAI Responses; native passthrough; streaming supported) | ✅ |
 | `POST /v1/messages` (Anthropic; streaming supported; capability-routed in v0.2) | ✅ |
 | `GET /v1/models` (proxied from upstream) | ✅ |
 | `GET /health` | ✅ |
@@ -97,7 +99,7 @@ A future release must provide finite statelessness at the process boundary: sess
 
 Errors returned by upstream Copilot must be rewritten to match the client's protocol shape:
 
-- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) return
+- OpenAI endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) return
   `{ error: { type, message, code } }`.
 - Anthropic endpoint (`/v1/messages`) returns
   `{ type: "error", error: { type, message } }`.
@@ -168,6 +170,12 @@ The process-local storage rule above is the current v0.2 implementation limit, n
 
 Before v0.2 implementation is considered complete, the Copilot `/responses` endpoint must be verified with the selected subscription using probes for non-streaming text, streaming text, request-level reasoning effort, streaming tool use, the following tool-result continuation turn, and base64 image input. The compatibility record must also preserve the observed rejection of external URL images. The probes must establish the accepted request-field names; observed completion, usage, tool-call, and error shapes; which exact endpoint-availability statuses or machine-readable codes guarantee rejection before model execution; and whether continuation requires response ids, function-call ids, completed output items, reasoning items or encrypted reasoning content, `previous_response_id`, `store`, or other opaque upstream state. For streaming output, state captured from an added/in-progress event must not be assumed complete unless the probe demonstrates it; completed item events must be tested separately. The observed payload and event shapes must be recorded in `spec.md`; implementation must follow observed Copilot behavior when it differs from the public OpenAI Responses shape. Public OpenAI documentation is a baseline, not evidence that Copilot accepts an unprobed field or event variant.
 
+### FR10. Native OpenAI Responses Passthrough
+
+Exact inbound `POST /v1/responses` must resolve the requested model through the live catalog and require exact HTTP `/responses` support. A valid model without that endpoint returns OpenAI `400 invalid_request_error`; `ws:/responses` is insufficient. Successful request and response bodies are passed through without protocol translation or participation in Messages continuation state. Non-2xx upstream bodies are bounded and safely rewritten rather than forwarded.
+
+`CopilotTransport` owns the pre-output 401 auth retry. The HTTP handler owns endpoint rejection re-planning: exact HTTP 400 code `unsupported_api_for_model` invalidates the current catalog generation, resolves the same model once with stale fallback disabled, and retries `/responses` once only if the new metadata still advertises it. It never switches model or endpoint, and a plain 400 does not retry.
+
 ## 6. Non-Functional Requirements
 
 - **NFR1 — Platform:** Windows / macOS / Linux fully supported, Node.js ≥ 18 (for native `fetch`).
@@ -209,3 +217,4 @@ Before v0.2 implementation is considered complete, the Copilot `/responses` endp
 - **AC13.** Unit tests cover request mapping, VS Code system-text message validation, request-level reasoning-effort validation against live model metadata, non-streaming response mapping, local URL-image rejection and base64-image validation, supported tool-choice and parallel-tool controls, continuation identity and expiry, completed reasoning/output-item capture, SSE frames split across arbitrary transport chunks, multiple frames in one chunk, tool-argument deltas, malformed upstream events, bounded buffers and metadata, downstream backpressure, abort/error/timeout races, external `/v1/models` passthrough isolation from catalog refresh, model lookup refresh, generation-scoped negative results, shared concurrent refresh with per-waiter cancellation, independent control-plane deadlines, last-waiter abort, bounded-stale cache use, the exact `400` plus `unsupported_api_for_model` pre-execution re-plan signal, rejection of ambiguous replay, missing or malformed `supported_endpoints`, missing required feature limits, token-refresh failure classification, and the intersection of model-declared and relay-implemented capabilities.
 - **AC14.** Automated tests use sentinel credentials and verify that no complete credential or credential substring appears in `status` output, persisted diagnostic state, logs at any level, HTTP errors, or thrown-error messages.
 - **AC15.** With the default info level, each HTTP request produces a correlated terminal log containing only the allowlisted lifecycle fields from NFR5. Debug mode additionally exposes enough structural metadata to distinguish message-role/content-shape failures without logging any content value. Tests cover success, local validation failure, upstream failure, and credential/content sentinels.
+- **AC16.** Native `POST /v1/responses` preserves successful JSON and SSE bytes, requires exact HTTP `/responses` capability, returns the FR10 OpenAI errors, safely rewrites non-2xx upstream bodies, retries only the verified endpoint-rejection signal once after a non-stale catalog refresh, and never enters Messages translation or continuation handling.
