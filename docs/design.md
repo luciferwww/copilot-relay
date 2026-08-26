@@ -2,7 +2,7 @@
 
 > Status: approved 2026-08-24; amended 2026-08-26. Aligned with the approved [requirement.md](./requirement.md); when the two conflict, `requirement.md` wins.
 
-> Follow-up design: [Native Responses v2](./native-responses-v2-design.md), originating from [@xlight](https://github.com/xlight)'s [PR #1](https://github.com/luciferwww/copilot-relay/pull/1), adapts native inbound `POST /v1/responses` to the post-PR #2 Messages-to-Responses architecture.
+> Decision record: [Native Responses v2](./native-responses-v2-decision.md), originating from [@xlight](https://github.com/xlight)'s [PR #1](https://github.com/luciferwww/copilot-relay/pull/1), records why native inbound `POST /v1/responses` was integrated with the post-PR #2 Messages-to-Responses architecture.
 
 > [!NOTE]
 > Diagrams in this document use Mermaid syntax. Open the preview pane in VS Code (`Ctrl+Shift+V` or the button in the top-right) to view them rendered; the `bierner.markdown-mermaid` extension is required (installed in this workspace). GitHub renders Mermaid natively — no extra setup.
