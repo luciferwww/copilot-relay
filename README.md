@@ -114,3 +114,8 @@ Notable fields:
 
 - This code is a **from-scratch reimplementation** of the public parts of the GitHub Copilot HTTP protocol, written for personal use.
 - GitHub Copilot subscription terms apply. Do not redistribute your Copilot token.
+
+## Contributors
+
+- [@xlight](https://github.com/xlight) — proposed and first implemented native
+  `POST /v1/responses` support in [PR #1](https://github.com/luciferwww/copilot-relay/pull/1).
