@@ -7,6 +7,7 @@ export const DATA_DIR = join(homedir(), '.copilot-relay');
 export const AUTH_FILE = join(DATA_DIR, 'auth.json');
 export const CONFIG_FILE = join(DATA_DIR, 'config.json');
 export const PID_FILE = join(DATA_DIR, 'server.pid');
+export const CONTINUATION_DIR = join(DATA_DIR, 'continuations');
 
 export interface AppConfig {
   host: string;

@@ -37,8 +37,7 @@ These are code constants, not v0.2 configuration fields.
 | `MODEL_CATALOG_TIMEOUT_MS` | 15 seconds | One internal catalog refresh |
 | `EXTERNAL_MODELS_TIMEOUT_MS` | 30 seconds | Client-facing `/v1/models` passthrough |
 | `MODEL_INVOCATION_TIMEOUT_MS` | 10 minutes | One generation request including retries |
-| `CONTINUATION_TTL_MS` | 24 hours | Continuation group idle lifetime, renewed by successful lookup |
-| `CONTINUATION_ABSOLUTE_TTL_MS` | 7 days | Maximum continuation group lifetime regardless of activity |
+| `CONTINUATION_TTL_MS` | 7 days | Continuation group idle lifetime, renewed by successful lookup; there is no absolute lifetime |
 | `CONTINUATION_MAX_GROUPS` | 256 | Published groups per process |
 | `CONTINUATION_GROUP_MAX_BYTES` | 2 MiB | Serialized items in one group |
 | `CONTINUATION_TOTAL_MAX_BYTES` | 32 MiB | Serialized items across all groups |
@@ -54,8 +53,9 @@ MiB means $1024^2$ bytes. Byte limits are enforced while reading or accumulating
 | `~/.copilot-relay/config.json` | User configuration |
 | `~/.copilot-relay/auth.json` | Authentication state |
 | `~/.copilot-relay/server.pid` | Foreground server PID |
+| `~/.copilot-relay/continuations/` | Versioned plaintext continuation group records |
 
-On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`; Windows relies on the user-profile ACL.
+On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`; the continuation directory uses mode `0700`, and its record and temporary files use mode `0600`. Windows relies on the user-profile ACL.
 
 ### 3.2 Config schema
 
@@ -311,14 +311,13 @@ interface ContinuationGroup {
   createdAt: number;
   lastAccessedAt: number;
   expiresAt: number;
-  absoluteExpiresAt: number;
   items: readonly CompletedContinuationItem[];
   calls: ReadonlyMap<string, { callId: string; outputIndex: number }>;
   byteSize: number;
 }
 ```
 
-Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity, capped by `absoluteExpiresAt`. Active conversations therefore survive ordinary pauses but cannot renew a group beyond `CONTINUATION_ABSOLUTE_TTL_MS`.
+Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity. Invalid, incomplete, model-mismatched, or otherwise failed lookups do not renew it. There is no absolute lifetime: a group remains available while successfully used within each seven-day window, subject to capacity-driven LRU eviction.
 
 ### 8.2 Staging and atomic publication
 
@@ -330,28 +329,32 @@ Each invocation owns an unpublished stage. A completed function-call item alloca
 2. Against that live view, reject duplicate ids or malformed/empty staged calls.
 3. Compute the new group byte size from UTF-8 JSON serialization. If it exceeds `CONTINUATION_GROUP_MAX_BYTES`, throw without mutation.
 4. In the temporary eviction plan, order live existing groups by `lastAccessedAt`, then `createdAt`, then `groupId`, and select the least recently used groups until adding the new group would satisfy both `CONTINUATION_MAX_GROUPS` and `CONTINUATION_TOTAL_MAX_BYTES`.
-5. In one critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state. Any failure before this step leaves the registry unchanged.
+5. Atomically install the new group's versioned record. A write failure leaves the in-memory registry unchanged and returns a translation 502 before success is committed to the client.
+6. In one synchronous critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state.
+7. Remove expired and evicted records. A failed cleanup is reported without identifiers or content; startup validation and LRU enforcement keep any leftover record unavailable when the store is reopened.
 
 For non-streaming output, publish occurs after complete validation and immediately before writing the Anthropic response. For streaming, it occurs after all tool blocks have been written and immediately before terminal `message_delta`. Failure or disconnect before publication discards the stage; disconnect after publication does not roll it back.
 
-Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, or id collision causes publication failure. Restart loses all groups and unresolved results return 400. Because the client-visible tool id does not contain the opaque upstream call state, a Claude Code conversation with unresolved or retained tool history must be restarted after the relay process restarts.
+Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, id collision, or required persistence failure causes publication failure. Unavailable ids return 400. Atomically published, unexpired groups are recovered after relay process replacement because the client-visible tool id alone does not contain the opaque upstream call state required for replay.
 
-### 8.3 Known restart limitation and future persistence contract
+The count and byte limits are fixed for this persistence phase and have no user-facing configuration. Each publication or startup-recovery plan that performs capacity-driven LRU eviction emits one warning, not one warning per removed group. The warning reports whether group count, aggregate bytes, or both triggered eviction, plus evicted-group count, aggregate group and byte totals before and after eviction, and the oldest evicted idle age. It must not contain group ids, tool ids, record names, model names, tool input, replay items, or other continuation content. Idle-TTL cleanup is expected lifecycle behavior and does not emit this warning.
 
-The current v0.2 registry is intentionally process-local. Its restart failure is observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from the normalized Anthropic history. Unknown ids therefore remain a 400 rather than triggering heuristic reconstruction.
+### 8.3 Persistent continuation contract
 
-A future persistence implementation must preserve finite statelessness across relay process replacement without changing the wire mapping. It must satisfy all of the following before replacing the current process-local contract:
+The released v0.2 registry was process-local. Its restart failure was observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from normalized Anthropic history. The persistent store preserves that authoritative group across process replacement; unknown, expired, or invalid ids remain a 400 rather than triggering heuristic reconstruction.
+
+The implementation preserves finite statelessness across relay process replacement without changing the wire mapping. It:
 
 - persist only atomically published groups and atomically remove expired or evicted groups;
-- use a versioned, authenticated, encrypted-at-rest format whose key is not embedded in the continuation data;
-- retain the existing per-group, total-byte, group-count, model-match, and renewable idle-TTL bounds;
-- validate schema, version, authentication, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
-- fail closed and delete or quarantine corrupted, incompatible, undecryptable, expired, or oversized records without logging their contents;
+- use one closed, versioned plaintext JSON record per group, named `<groupId>.json`, where `groupId` is the existing random UUID;
+- protect the continuation directory and files with the OS user boundary: Unix modes `0700` and `0600`, and the user-profile ACL on Windows;
+- retain the existing per-group, total-byte, group-count, and model-match bounds, with a renewable 7-day idle TTL and no absolute lifetime;
+- emit safe aggregate warnings for capacity-driven LRU eviction without logging continuation ids or content;
+- validate filename/payload agreement, schema, version, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
+- fail closed and delete or quarantine malformed, incompatible, expired, or oversized records without logging their names or contents;
 - never persist client message history beyond the authoritative Responses items and call metadata required for replay;
-- define atomic replacement, crash recovery, file locking, logout cleanup, and concurrent-process ownership before implementation;
-- prove with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
-
-Until that contract is implemented, restart resilience is not an acceptance property of v0.2 and clients must begin a new conversation after relay restart when retained tool history is present.
+- uses flushed temporary files and same-directory atomic rename for record replacement, startup recovery before listening, and an exclusive owner record that blocks a second live relay process; authentication commands do not mutate continuation records;
+- proves with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
 
 ## 9. Non-streaming Responses mapping
 

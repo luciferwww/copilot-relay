@@ -1,13 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AppConfig } from './config.js';
 import { isLoopbackHost, RemoteAccessRequiredError } from './bind-policy.js';
 import { startHttpServer, type HttpRuntime } from './http-server.js';
 import { setLevel } from './logger.js';
 import { ModelCatalogError, type ModelRecord } from './models/ModelCatalog.js';
 import { ContinuationRegistry } from './translate/responses/ContinuationRegistry.js';
+import { ContinuationStore, type ContinuationStoreLike } from './translate/responses/ContinuationStore.js';
 import { REQUEST_BODY_MAX_BYTES } from './translate/responses/types.js';
+import type { ContinuationStage } from './translate/responses/types.js';
 import type { InvocationContext, InvocationPlan } from './upstream/CopilotTransport.js';
 
 const CONFIG: AppConfig = {
@@ -53,6 +58,40 @@ test('HTTP server accepts explicitly authorized wildcard binding', async () => {
   }
 });
 
+test('HTTP server releases its runtime exactly once on close', async () => {
+  let closeCount = 0;
+  const runtime = runtimeFor({ id: 'unused', supported_endpoints: [] }, async () => {
+    throw new Error('upstream must not be called');
+  });
+  runtime.close = () => { closeCount += 1; };
+  const server = await startHttpServer(CONFIG, { runtime });
+
+  await server.close();
+
+  assert.equal(closeCount, 1);
+});
+
+test('HTTP server releases its runtime when listener startup fails', async () => {
+  const first = await startHttpServer(CONFIG, {
+    runtime: runtimeFor({ id: 'unused', supported_endpoints: [] }, async () => {
+      throw new Error('upstream must not be called');
+    }),
+  });
+  let closeCount = 0;
+  const secondRuntime = runtimeFor({ id: 'unused', supported_endpoints: [] }, async () => {
+    throw new Error('upstream must not be called');
+  });
+  secondRuntime.close = () => { closeCount += 1; };
+  try {
+    await assert.rejects(
+      startHttpServer({ ...CONFIG, port: first.port }, { runtime: secondRuntime }),
+    );
+    assert.equal(closeCount, 1);
+  } finally {
+    await first.close();
+  }
+});
+
 function invocationContext(): InvocationContext {
   return {
     authRetryUsed: false,
@@ -82,6 +121,27 @@ function runtimeFor(
       proxyModels: async () => new Response('{"data":[]}'),
     } as unknown as HttpRuntime['transport'],
   };
+}
+
+function addContinuationCall(
+  registry: ContinuationRegistry,
+  stage: ContinuationStage,
+  toolId: string,
+): void {
+  const item = {
+    type: 'function_call' as const,
+    call_id: 'upstream-call',
+    name: 'lookup',
+    arguments: '{"path":"README.md"}',
+    status: 'completed',
+  };
+  registry.addItem(stage, { outputIndex: 0, item });
+  registry.addCall(stage, toolId, {
+    callId: item.call_id,
+    outputIndex: 0,
+    name: item.name,
+    input: { path: 'README.md' },
+  });
 }
 
 test('HTTP Messages body boundary returns Anthropic 415 and 400 errors', async () => {
@@ -267,6 +327,266 @@ test('native Responses invokes upstream without accessing the model catalog', as
     assert.equal(invocations, 1);
   } finally {
     await server.close();
+  }
+});
+
+test('translated publication persistence failure returns a safe Anthropic 502', async () => {
+  const filesystemSentinel = 'C:\\private\\continuations\\SECRET_RECORD.json';
+  const groupId = '11111111-1111-4111-8111-111111111111';
+  const toolId = '22222222-2222-4222-8222-222222222222';
+  const model: ModelRecord = {
+    id: 'gpt-test',
+    supported_endpoints: ['/responses'],
+    capabilities: { supports: {}, limits: { max_output_tokens: 1024 } },
+  };
+  const store: ContinuationStoreLike = {
+    load: () => [],
+    write: () => { throw new Error(filesystemSentinel); },
+    remove: () => undefined,
+  };
+  const ids = [groupId, toolId];
+  const baseRuntime = runtimeFor(model, async () => Response.json({
+    id: 'response-id',
+    model: 'gpt-test',
+    status: 'completed',
+    output: [{
+      type: 'function_call',
+      call_id: 'upstream-call',
+      name: 'lookup',
+      arguments: '{"path":"README.md"}',
+      status: 'completed',
+    }],
+    usage: { input_tokens: 1, output_tokens: 1 },
+  }));
+  const runtime: HttpRuntime = {
+    ...baseRuntime,
+    registry: new ContinuationRegistry({
+      randomId: () => ids.shift() as string,
+      store,
+    }),
+  };
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        messages: [{ role: 'user', content: 'hello' }],
+        max_tokens: 16,
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 502);
+    assert.deepEqual(JSON.parse(text), {
+      type: 'error',
+      error: { type: 'api_error', message: 'Continuation state could not be persisted.' },
+    });
+    assert.equal(text.includes(filesystemSentinel), false);
+    assert.equal(text.includes(groupId), false);
+    assert.equal(text.includes(toolId), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('renewal persistence failure returns 502 before upstream execution', async () => {
+  const model: ModelRecord = {
+    id: 'gpt-test',
+    supported_endpoints: ['/responses'],
+    capabilities: { supports: {}, limits: { max_output_tokens: 1024 } },
+  };
+  let writes = 0;
+  const store: ContinuationStoreLike = {
+    load: () => [],
+    write: () => {
+      writes += 1;
+      if (writes > 1) throw new Error('RENEWAL_FILESYSTEM_SENTINEL');
+    },
+    remove: () => undefined,
+  };
+  const ids = [
+    '11111111-1111-4111-8111-111111111111',
+    '22222222-2222-4222-8222-222222222222',
+  ];
+  let invocations = 0;
+  const baseRuntime = runtimeFor(model, async () => {
+    invocations += 1;
+    return new Response('unexpected');
+  });
+  const registry = new ContinuationRegistry({
+    randomId: () => ids.shift() as string,
+    store,
+  });
+  const stage = registry.createStage('gpt-test');
+  const toolId = registry.allocateToolId(stage);
+  addContinuationCall(registry, stage, toolId);
+  registry.publish(stage);
+  const runtime: HttpRuntime = { ...baseRuntime, registry };
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        max_tokens: 16,
+        messages: [
+          { role: 'assistant', content: [{
+            type: 'tool_use',
+            id: toolId,
+            name: 'lookup',
+            input: { path: 'README.md' },
+          }] },
+          { role: 'user', content: [{
+            type: 'tool_result',
+            tool_use_id: toolId,
+            content: 'done',
+          }] },
+        ],
+      }),
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      type: 'error',
+      error: { type: 'api_error', message: 'Continuation state could not be persisted.' },
+    });
+    assert.equal(invocations, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('translated tool continuation survives server replacement and replays authoritative state', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'copilot-relay-http-continuation-'));
+  const model: ModelRecord = {
+    id: 'gpt-test',
+    supported_endpoints: ['/responses'],
+    capabilities: { supports: {}, limits: { max_output_tokens: 1024 } },
+  };
+  const ids = [
+    '11111111-1111-4111-8111-111111111111',
+    '22222222-2222-4222-8222-222222222222',
+  ];
+  try {
+    const firstBaseRuntime = runtimeFor(model, async () => Response.json({
+      id: 'response-id',
+      model: 'gpt-test',
+      status: 'completed',
+      output: [
+        {
+          id: 'reasoning-item',
+          type: 'reasoning',
+          encrypted_content: 'opaque-reasoning',
+          summary: [],
+          status: 'completed',
+        },
+        {
+          id: 'function-item',
+          type: 'function_call',
+          call_id: 'upstream-call',
+          name: 'lookup',
+          arguments: '{"path":"README.md"}',
+          status: 'completed',
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+    const firstRegistry = new ContinuationRegistry({
+      randomId: () => ids.shift() as string,
+      store: new ContinuationStore(directory),
+    });
+    const firstRuntime: HttpRuntime = {
+      ...firstBaseRuntime,
+      registry: firstRegistry,
+      close: () => firstRegistry.close(),
+    };
+    const firstServer = await startHttpServer(CONFIG, { runtime: firstRuntime });
+    let toolId: string;
+    try {
+      const response = await fetch(`http://127.0.0.1:${firstServer.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-test',
+          messages: [{ role: 'user', content: 'find the file' }],
+          max_tokens: 16,
+        }),
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as {
+        content: Array<{ type: string; id?: string }>;
+      };
+      const toolUse = body.content.find((entry) => entry.type === 'tool_use');
+      assert.ok(toolUse?.id);
+      toolId = toolUse.id;
+    } finally {
+      await firstServer.close();
+    }
+
+    let replayedBody: Record<string, unknown> | undefined;
+    const secondBaseRuntime = runtimeFor(model, async (plan) => {
+      replayedBody = JSON.parse(Buffer.from(plan.body).toString('utf8')) as Record<string, unknown>;
+      return Response.json({
+        id: 'response-id-2',
+        model: 'gpt-test',
+        status: 'completed',
+        output: [{
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'done' }],
+        }],
+        usage: { input_tokens: 2, output_tokens: 1 },
+      });
+    });
+    const secondRegistry = new ContinuationRegistry({
+      store: new ContinuationStore(directory),
+    });
+    const secondRuntime: HttpRuntime = {
+      ...secondBaseRuntime,
+      registry: secondRegistry,
+      close: () => secondRegistry.close(),
+    };
+    const secondServer = await startHttpServer(CONFIG, { runtime: secondRuntime });
+    try {
+      const response = await fetch(`http://127.0.0.1:${secondServer.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-test',
+          max_tokens: 16,
+          messages: [
+            { role: 'user', content: 'find the file' },
+            { role: 'assistant', content: [{
+              type: 'tool_use',
+              id: toolId,
+              name: 'lookup',
+              input: { path: 'README.md' },
+            }] },
+            { role: 'user', content: [{
+              type: 'tool_result',
+              tool_use_id: toolId,
+              content: 'file contents',
+            }] },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200);
+      const input = replayedBody?.input as Array<Record<string, unknown>>;
+      assert.equal(input[0].role, 'user');
+      assert.deepEqual(input.slice(1).map((entry) => entry.type), [
+        'reasoning', 'function_call', 'function_call_output',
+      ]);
+      assert.equal(input[1].encrypted_content, 'opaque-reasoning');
+      assert.equal(input[2].call_id, 'upstream-call');
+      assert.equal(input[3].call_id, 'upstream-call');
+      assert.equal(input[3].output, 'file contents');
+    } finally {
+      await secondServer.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

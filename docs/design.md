@@ -4,6 +4,8 @@
 
 > Decision record: [Native Responses v2](./native-responses-v2-decision.md), originating from [@xlight](https://github.com/xlight)'s [PR #1](https://github.com/luciferwww/copilot-relay/pull/1), records why native inbound `POST /v1/responses` was integrated with the post-PR #2 Messages-to-Responses architecture.
 
+> Decision record: [Continuation Persistence](./continuation-persistence-decision.md) defines the implemented bounded plaintext JSON per-group store protected by the OS user boundary behind `ContinuationRegistry`.
+
 > [!NOTE]
 > Diagrams in this document use Mermaid syntax. Open the preview pane in VS Code (`Ctrl+Shift+V` or the button in the top-right) to view them rendered; the `bierner.markdown-mermaid` extension is required (installed in this workspace). GitHub renders Mermaid natively — no extra setup.
 
@@ -24,7 +26,8 @@ flowchart LR
         L[Responses Request Mapper]
         M[Responses Output Mapper]
         N[Responses SSE Translator]
-        O[Continuation Registry<br/>bounded in-memory state]
+        O[Continuation Registry<br/>bounded in-memory index]
+        Q[Continuation Store<br/>plaintext per-group JSON]
         P[Safe Output Boundary<br/>allowlisted diagnostics]
         K[Config<br/>src/config.ts]
         E[(auth.json)]
@@ -44,6 +47,7 @@ flowchart LR
     J -->|Messages passthrough| D
     J -->|Responses translation| L
     L <--> O
+    O <--> Q
     L --> D
     D --> C
     C -- read/write --> E
@@ -83,7 +87,8 @@ flowchart LR
 | Responses request mapper | `src/translate/responses/request-mapper.ts` | Pure validated Anthropic Messages → Responses JSON mapping |
 | Responses output mapper | `src/translate/responses/response-mapper.ts` | Pure non-streaming Responses → Anthropic Message mapping |
 | Responses SSE translator | `src/translate/responses/SseTranslator.ts` | Incremental SSE parsing and Anthropic event sequencing |
-| Continuation registry | `src/translate/responses/ContinuationRegistry.ts` | Bounded in-memory association between emitted Anthropic tool ids and authoritative completed Responses items needed for a following tool-result turn |
+| Continuation registry | `src/translate/responses/ContinuationRegistry.ts` | Bounded in-memory association between emitted Anthropic tool ids and authoritative completed Responses items; owns staging, lookup, TTL, limits, LRU, and store commit order |
+| Continuation store | `src/translate/responses/ContinuationStore.ts` | Single-owner, versioned plaintext JSON records protected by user-only OS permissions for atomically published continuation groups; startup recovery, atomic replacement, deletion, and safe typed failures |
 | Translation types | `src/translate/responses/types.ts` | Boundary types, mapping results, stream state, typed translation errors |
 
 ## 3. Key Flows
@@ -242,13 +247,21 @@ The published group contains the model id, each external tool id and upstream `c
 
 On a following request, the mapper scans complete history in order and may resolve multiple previously published groups. Each assistant tool-use set opens exactly its original group, its later user results close that group, and a later group is validated independently after the earlier group closes. Every `tool_result.tool_use_id` must resolve to an unexpired group, match the requested model and historical tool-use block, and map to exactly one upstream `function_call_output.call_id`; mixed groups within one parallel call set, missing results, expired or duplicated ids, cross-model references, out-of-order reuse, and unclosed groups fail with Anthropic 400 before transport. Each valid group is replayed once at its original history position. Published groups are immutable and may be read repeatedly until eviction; they are not reserved or consumed by one request because Anthropic clients resend complete history, retries may replay it, and conversations may branch. Preventing duplicate model execution is an independent request-idempotency concern and is not inferred from continuation lookup.
 
-Entries are process-local, size- and age-bounded, never persisted, and evicted deterministically. Successful lookup renews a 24-hour idle deadline but never extends the 7-day absolute lifetime. An oversized new group fails publication; group-count or aggregate-byte pressure atomically evicts the least recently accessed groups before inserting the new one, as defined in `spec.md`. A process restart therefore makes outstanding tool continuations explicitly unavailable rather than reconstructing hidden state from names or text.
+The implemented store retains the released v0.2 fixed size limits and deterministic eviction semantics while making atomically published groups recoverable. Successful lookup renews the complete group's idle deadline to seven days after that lookup; there is no absolute lifetime. An oversized new group fails publication; group-count or aggregate-byte pressure atomically evicts the least recently accessed groups before inserting the new one, as defined in `spec.md`. Each capacity-driven eviction plan emits one safe warning with only trigger, aggregate count, byte, and age metadata; ordinary idle expiry does not warn.
 
-This restart sensitivity is a known architectural limitation. Anthropic history preserves the relay-issued tool id but does not preserve the complete authoritative Responses replay group: the upstream `call_id`, completed function-call item, and model-dependent reasoning or encrypted reasoning item may all be required. Using only client-normalized tool input would weaken continuation identity and could send a result to the wrong or incomplete upstream call.
+The seven-day sliding window covers relay restarts, ordinary overnight or weekend pauses, and long-running sessions whose retained history continues to reference a group. It cannot guarantee recovery when a session resumes after more than seven days without a successful lookup or when fixed-capacity pressure evicts cold state earlier. Shared storage and multiple active relay processes remain outside this phase.
 
-The post-v0.2 target is **finite statelessness at the process boundary**. Protocol translation may retain the minimum bounded continuation state, but correctness for an unexpired published group must not depend on a particular relay process remaining alive. The preferred architecture adds a recoverable store behind `ContinuationRegistry`: an in-memory index remains the fast path, while successful publication, access-time renewal, and eviction are mirrored atomically to a versioned encrypted local snapshot or journal. Startup loads only authenticated, schema-valid, unexpired records and enforces the same per-group, total-byte, count, renewable idle-TTL, absolute-lifetime, and least-recently-used eviction limits before exposing them to lookup.
+The released v0.2 restart sensitivity established the persistence requirement. Anthropic history preserves the relay-issued tool id but does not preserve the complete authoritative Responses replay group: the upstream `call_id`, completed function-call item, and model-dependent reasoning or encrypted reasoning item may all be required. Using only client-normalized tool input would weaken continuation identity and could send a result to the wrong or incomplete upstream call.
 
-The future store must not turn continuation into a long-term conversation database. It persists only authoritative replay fields already required by the translator, never arbitrary message history; plaintext tool input or reasoning content must not be written to disk; encryption keys must not be embedded in the continuation data; corruption, incompatible versions, decryption failure, model mismatch, or expiry must fail closed and remove the unusable record. Exact key management, file locking, crash recovery, logout cleanup, and multi-process ownership require a separate security design before implementation.
+The continuation store provides **finite statelessness at the process boundary**. It sits behind `ContinuationRegistry`; the in-memory index remains the lookup fast path, while successful publication and access-time renewal atomically replace one plaintext JSON group record and eviction removes complete records. There is no database, whole-registry snapshot, or append journal. This bounds synchronous durability work by the existing 2 MiB per-group limit instead of the 32 MiB aggregate limit and avoids journal compaction and replay ordering.
+
+Each record is a closed, versioned JSON object named `<groupId>.json`. The existing `groupId` is a cryptographically random, filesystem-safe UUID, so no second storage id or filename index is needed; startup verifies that filename and payload agree. The record contains the existing authoritative replay group: ids, model association, timestamps, completed function-call and reasoning items, and call metadata including name and authoritative input needed for historical-tool validation. It never contains arbitrary message history, response text, tool results, credentials, native Responses traffic, or model-catalog state.
+
+These records are sensitive plaintext. Unix-like systems use mode `0700` for the continuation directory and `0600` for record and temporary files; Windows relies on the user-profile ACL boundary. Application-managed encryption with a same-user local key is intentionally omitted because it does not protect against a process that can read both key and records and would add key lifecycle and recovery failure modes. The design does not protect against the same OS user, administrators, same-user malware, or backup copies.
+
+The durable rename of a complete new record is the publication commit point and occurs before the group is exposed in memory. A successful lookup durably replaces the renewed record before changing in-memory expiry. Store failure therefore returns a typed translation 502 rather than silently degrading to process-local correctness. Expiry and eviction remove live mappings first and stale files cannot re-enter the registry because startup always reapplies validation, expiry, collision, count, byte, and deterministic LRU rules before publishing recovered indexes.
+
+One relay process owns a data directory. Startup acquires exclusive ownership, opens the protected continuation directory, parses and validates bounded candidate files, builds temporary indexes, and publishes the recovered set before listening. Bad records fail closed without record-name- or content-bearing logs. Authentication and continuation lifecycles are independent: account-changing login and logout preserve records, allowing retained local sessions to attempt replay after a later login. The newly authenticated account's model access and any upstream account binding remain authoritative. Shared storage, active-active writers, and externally keyed encryption are deferred. Exact record schemas, limits, operation ordering, and proofs belong in `spec.md`; rationale is recorded in [continuation-persistence-decision.md](./continuation-persistence-decision.md).
 
 ## 4. Technical Choices & Tradeoffs
 
@@ -432,7 +445,7 @@ Reserved but **not implemented in v0.2**:
 ## 12. Test Strategy
 
 - Pure mapper fixtures cover every accepted and rejected row in the spec mapping matrix, including base64 image mapping and local URL-image rejection.
-- Continuation fixtures cover request-local staging, atomic publish only after response completion, discard before the commit point, repeated immutable lookup, non-streaming and streaming tool calls, completed reasoning-item capture, parallel calls, exact `call_id` reuse, expiry/eviction, restart loss, model mismatch, and cross-group rejection.
+- Continuation fixtures cover request-local staging, durable atomic publish only after response completion, discard before the commit point, repeated immutable lookup, non-streaming and streaming tool calls, completed reasoning-item capture, parallel calls, exact `call_id` reuse, expiry/eviction, restart and renewal recovery, malformed or filename-mismatched state, user-only permissions, persistence failures, single-owner enforcement, model mismatch, and cross-group rejection.
 - Model catalog tests use captured `/models` fixtures plus malformed variants; production code never imports those fixtures.
 - Route-planner table tests cover endpoint combinations, missing metadata, translator availability, and exact model-id preservation.
 - SSE tests partition identical event bytes at every boundary, combine multiple frames per chunk, split UTF-8 code points, interleave multiple output items according to the probed event table, and reject missing `response.created`, conflicting item keys, incomplete items at response completion, and every undocumented transition.

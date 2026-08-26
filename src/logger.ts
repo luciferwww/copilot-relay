@@ -74,6 +74,16 @@ export interface RequestTerminalLog extends RequestLogBase {
   readonly replanUsed: boolean;
 }
 
+export interface ContinuationCapacityEvictionLog {
+  readonly trigger: 'group-count' | 'aggregate-bytes' | 'group-count-and-aggregate-bytes';
+  readonly evictedGroupCount: number;
+  readonly groupCountBefore: number;
+  readonly groupCountAfter: number;
+  readonly totalBytesBefore: number;
+  readonly totalBytesAfter: number;
+  readonly oldestEvictedIdleAgeMs: number;
+}
+
 const order: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 let current: LogLevel = 'info';
@@ -110,4 +120,6 @@ export const logger = {
     event: 'request.completed' | 'request.failed' | 'request.canceled',
     fields: RequestTerminalLog,
   ) => logEvent('info', event, fields),
+  continuationCapacityEvicted: (fields: ContinuationCapacityEvictionLog) =>
+    logEvent('warn', 'continuation.capacity_evicted', fields),
 };

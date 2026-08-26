@@ -66,7 +66,6 @@ export interface ContinuationGroup {
   createdAt: number;
   lastAccessedAt: number;
   expiresAt: number;
-  absoluteExpiresAt: number;
   items: readonly CompletedContinuationItem[];
   calls: ReadonlyMap<string, ContinuationCall>;
   byteSize: number;
