@@ -6,6 +6,7 @@ import { Command } from 'commander';
 import { AUTH_FILE, CONFIG_FILE, PID_FILE, loadConfig, saveConfigDefaults } from './config.js';
 import { logger, setLevel, type LogLevel } from './logger.js';
 import { loginWithDeviceCode } from './auth/deviceCode.js';
+import { AUTH_REFRESH_TIMEOUT_MS } from './auth/AuthManager.js';
 import {
   clearAuth,
   isAuthValid,
@@ -19,7 +20,7 @@ const program = new Command();
 program
   .name('copilot-relay')
   .description('Local proxy exposing OpenAI/Anthropic APIs backed by GitHub Copilot.')
-  .version('0.1.0');
+  .version('0.2.0');
 
 program
   .command('start')
@@ -47,13 +48,13 @@ program
               'Use "copilot-relay stop" first.',
           );
           process.exit(1);
-        } catch (e) {
-          const code = (e as { code?: string }).code;
+        } catch (error) {
+          const code = (error as { code?: string }).code;
           if (code === 'ESRCH') {
             logger.warn(`Stale pid file (pid=${existing} not alive); overwriting.`);
           } else {
             console.log(
-              `Cannot verify pid ${existing} (${code ?? (e as Error).message}); ` +
+              `Cannot verify pid ${existing} (${code ?? 'unknown_error'}); ` +
                 'refusing to overwrite. Remove the pid file manually if you are sure.',
             );
             process.exit(1);
@@ -64,7 +65,17 @@ program
       }
     }
     writeFileSync(PID_FILE, String(process.pid), 'utf8');
-    const handle = await startServer(cfg);
+    let handle;
+    try {
+      handle = await startServer(cfg);
+    } catch (error) {
+      try {
+        unlinkSync(PID_FILE);
+      } catch {
+        // The PID file may already have been removed by external cleanup.
+      }
+      throw error;
+    }
     const shutdown = async () => {
       logger.info('Shutting down...');
       await handle.close();
@@ -91,8 +102,9 @@ program
     try {
       process.kill(pid);
       logger.info(`Sent SIGTERM to ${pid}`);
-    } catch (e) {
-      logger.warn(`Could not signal pid ${pid}: ${(e as Error).message}`);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'unknown_error';
+      logger.warn(`Could not signal pid ${pid}: ${code}`);
     }
     try {
       unlinkSync(PID_FILE);
@@ -113,7 +125,11 @@ program
     });
     const auth = { accessToken };
     saveAuth(auth);
-    const refreshed = await refreshCopilotToken(auth, cfg);
+    const refreshed = await refreshCopilotToken(
+      auth,
+      cfg,
+      AbortSignal.timeout(AUTH_REFRESH_TIMEOUT_MS),
+    );
     const until = refreshed.copilotExpiresAt
       ? new Date(refreshed.copilotExpiresAt * 1000).toISOString()
       : 'unknown';
@@ -147,7 +163,7 @@ program
       return;
     }
     console.log('Auth file: ' + AUTH_FILE);
-    console.log('  github access token: ' + auth.accessToken.slice(0, 8) + '...(hidden)');
+    console.log('  github login: yes');
     if (auth.copilotToken && auth.copilotExpiresAt) {
       console.log(
         '  copilot token expires: ' + new Date(auth.copilotExpiresAt * 1000).toISOString(),
@@ -156,12 +172,11 @@ program
       console.log('  copilot token: none (will be fetched on first request)');
     }
     console.log('  copilot api base: ' + (auth.copilotApiBase ?? '(default)'));
-    // Spec §1.3 — auth valid line derived from isAuthValid + lastRefreshError.
     if (isAuthValid(auth)) {
       console.log('  auth valid: yes');
     } else {
-      const reason = auth.lastRefreshError ?? 'access_token missing, please re-login';
-      console.log('  auth valid: no – ' + reason);
+      console.log('  auth valid: no');
+      console.log('  auth status: access token rejected; run login again');
     }
   });
 
@@ -204,7 +219,6 @@ configureCmd
     existing.env = env;
     writeFileSync(settingsPath, JSON.stringify(existing, null, 2), 'utf8');
     console.log('Wrote ' + settingsPath);
-    console.log(JSON.stringify(existing, null, 2));
   });
 
 configureCmd
@@ -212,13 +226,13 @@ configureCmd
   .description('(v0.2) Write Codex CLI settings.')
   .action(() => {
     logger.error(
-      'Codex configuration is not implemented yet in v0.1. ' +
-        'Planned for v0.2 once the Codex CLI config schema is confirmed.',
+      'Codex configuration is not implemented. ' +
+        'A future release can add it after the Codex CLI config schema is confirmed.',
     );
     process.exit(2);
   });
 
-program.parseAsync(process.argv).catch((err) => {
-  logger.error(err);
+program.parseAsync(process.argv).catch(() => {
+  logger.error('Command failed.');
   process.exit(1);
 });

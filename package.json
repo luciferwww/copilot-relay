@@ -1,6 +1,6 @@
 {
   "name": "copilot-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local proxy exposing OpenAI/Anthropic APIs backed by GitHub Copilot.",
   "private": true,
   "license": "UNLICENSED",
@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "dev": "tsc --watch",
     "start": "node ./dist/cli.js",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""

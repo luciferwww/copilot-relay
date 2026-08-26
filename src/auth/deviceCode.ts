@@ -44,8 +44,8 @@ export async function loginWithDeviceCode(
   if (openBrowser) {
     try {
       await openUrl(dc.verification_uri);
-    } catch (e) {
-      logger.warn('Failed to open browser automatically:', (e as Error).message);
+    } catch {
+      logger.warn('Failed to open the browser automatically.');
     }
   }
 
@@ -60,7 +60,7 @@ async function requestDeviceCode(clientId: string): Promise<DeviceCodeResponse> 
     body: JSON.stringify({ client_id: clientId, scope: SCOPE }),
   });
   if (!res.ok) {
-    throw new Error(`Device code request failed: ${res.status} ${await res.text()}`);
+    throw new Error(`Device code request failed with HTTP ${res.status}.`);
   }
   return (await res.json()) as DeviceCodeResponse;
 }
@@ -99,9 +99,7 @@ async function pollForToken(
       // GitHub returns 200 for the documented OAuth states (pending / slow_down / etc).
       // Non-2xx here means transport-level trouble (5xx, 429, HTML error page) that
       // will not parse as AccessTokenResponse. Surface it instead of silently looping.
-      throw new Error(
-        `Device auth poll failed: ${res.status} ${(await res.text()).slice(0, 200)}`,
-      );
+      throw new Error(`Device auth poll failed with HTTP ${res.status}.`);
     }
     const data = (await res.json()) as AccessTokenResponse;
 
@@ -112,9 +110,12 @@ async function pollForToken(
       waitMs = Math.min(waitMs + 5000, MAX_INTERVAL_MS);
       continue;
     }
-    throw new Error(
-      `Device auth failed: ${data.error ?? 'unknown_error'} ${data.error_description ?? ''}`.trim(),
-    );
+    const knownError = ['access_denied', 'expired_token', 'incorrect_device_code'].includes(
+      data.error ?? '',
+    )
+      ? data.error
+      : 'unknown_error';
+    throw new Error(`Device auth failed with ${knownError}.`);
   }
   throw new Error('Device code expired before user authorized.');
 }

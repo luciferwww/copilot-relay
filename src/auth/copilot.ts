@@ -11,6 +11,10 @@ export interface AuthState {
   copilotExpiresAt?: number;
   /** endpoints.api from the Copilot token response. */
   copilotApiBase?: string;
+  invalid?: {
+    code: 'access_token_rejected';
+    at: string;
+  };
   /**
    * Reason of the last failed Copilot token refresh (e.g. access_token revoked).
    * Cleared on any successful refresh. Consumed by {@link isAuthValid} and
@@ -31,8 +35,8 @@ export function loadAuth(): AuthState | null {
   if (!existsSync(AUTH_FILE)) return null;
   try {
     return JSON.parse(readFileSync(AUTH_FILE, 'utf8')) as AuthState;
-  } catch (e) {
-    logger.warn('Failed to parse auth file:', (e as Error).message);
+  } catch {
+    logger.warn('Failed to parse the auth file.');
     return null;
   }
 }
@@ -54,7 +58,7 @@ export function clearAuth(): void {
 /** Spec §11.1: state exists, accessToken present, last refresh did not fail. */
 export function isAuthValid(state: AuthState | null): boolean {
   if (!state || !state.accessToken) return false;
-  return !state.lastRefreshError;
+  return !state.invalid;
 }
 
 export function isCopilotTokenValid(state: AuthState): boolean {
@@ -65,10 +69,12 @@ export function isCopilotTokenValid(state: AuthState): boolean {
 export async function refreshCopilotToken(
   state: AuthState,
   cfg: AppConfig,
+  signal?: AbortSignal,
 ): Promise<AuthState> {
   logger.debug('Refreshing Copilot token...');
   const res = await fetch(COPILOT_TOKEN_URL, {
     method: 'GET',
+    signal,
     headers: {
       Authorization: `token ${state.accessToken}`,
       Accept: 'application/json',
@@ -78,35 +84,41 @@ export async function refreshCopilotToken(
     },
   });
   if (!res.ok) {
-    // Persist the failure marker but do NOT overwrite the copilot token fields
-    // (spec §11.1: on refresh failure, previously stored token fields are kept as-is).
-    // Truncate the upstream body so a large HTML error page cannot bloat auth.json
-    // (or any log line that echoes this message). Slice by code points (via
-    // Array.from) rather than UTF-16 code units so a multi-byte character
-    // (emoji, CJK supplementary plane) is not cut in the middle, which would
-    // leave a lone surrogate that renders as a replacement character downstream.
-    const MAX_BODY_CODEPOINTS = 500;
-    const rawBody = await res.text();
-    const codePoints = Array.from(rawBody);
-    const bodyExcerpt =
-      codePoints.length > MAX_BODY_CODEPOINTS
-        ? codePoints.slice(0, MAX_BODY_CODEPOINTS).join('') + '…(truncated)'
-        : rawBody;
-    const reason = `Copilot token exchange failed: ${res.status} ${bodyExcerpt}`;
-    saveAuth({ ...state, lastRefreshError: reason });
-    throw new Error(reason);
+    if (res.status === 401) {
+      saveAuth({
+        ...state,
+        invalid: { code: 'access_token_rejected', at: new Date().toISOString() },
+        lastRefreshError: undefined,
+      });
+      throw new Error('GitHub access token was rejected. Run login again.');
+    }
+    throw new Error(`Copilot token exchange failed with HTTP ${res.status}.`);
   }
-  const data = (await res.json()) as {
-    token: string;
-    expires_at: number;
-    endpoints?: { api?: string };
-  };
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error('Copilot token exchange returned invalid JSON.');
+  }
+  if (
+    typeof data !== 'object' ||
+    data === null ||
+    typeof (data as { token?: unknown }).token !== 'string' ||
+    (data as { token: string }).token.length === 0 ||
+    typeof (data as { expires_at?: unknown }).expires_at !== 'number' ||
+    !Number.isFinite((data as { expires_at: number }).expires_at) ||
+    typeof (data as { endpoints?: { api?: unknown } }).endpoints?.api !== 'string' ||
+    (data as { endpoints: { api: string } }).endpoints.api.length === 0
+  ) {
+    throw new Error('Copilot token exchange returned incomplete data.');
+  }
+  const tokenData = data as { token: string; expires_at: number; endpoints: { api: string } };
   const next: AuthState = {
     ...state,
-    copilotToken: data.token,
-    copilotExpiresAt: data.expires_at,
-    copilotApiBase:
-      data.endpoints?.api ?? state.copilotApiBase ?? 'https://api.githubcopilot.com',
+    copilotToken: tokenData.token,
+    copilotExpiresAt: tokenData.expires_at,
+    copilotApiBase: tokenData.endpoints.api,
+    invalid: undefined,
     lastRefreshError: undefined,
   };
   saveAuth(next);

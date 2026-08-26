@@ -39,15 +39,45 @@ export function loadConfig(): AppConfig {
   ensureDataDir();
   if (!existsSync(CONFIG_FILE)) return { ...DEFAULT_CONFIG };
   try {
-    const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) as Partial<AppConfig>;
-    return { ...DEFAULT_CONFIG, ...raw };
+    return resolveConfig(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')));
   } catch {
     return { ...DEFAULT_CONFIG };
   }
+}
+
+/** Projects unknown JSON onto the exact public configuration schema. */
+export function resolveConfig(value: unknown): AppConfig {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ...DEFAULT_CONFIG };
+  }
+  const raw = value as Record<string, unknown>;
+  const logLevel = raw.logLevel;
+  return {
+    port: typeof raw.port === 'number' && Number.isInteger(raw.port) ? raw.port : DEFAULT_CONFIG.port,
+    logLevel:
+      logLevel === 'debug' || logLevel === 'info' || logLevel === 'warn' || logLevel === 'error'
+        ? logLevel
+        : DEFAULT_CONFIG.logLevel,
+    githubClientId: stringOrDefault(raw.githubClientId, DEFAULT_CONFIG.githubClientId),
+    editorVersion: stringOrDefault(raw.editorVersion, DEFAULT_CONFIG.editorVersion),
+    editorPluginVersion: stringOrDefault(
+      raw.editorPluginVersion,
+      DEFAULT_CONFIG.editorPluginVersion,
+    ),
+    copilotIntegrationId: stringOrDefault(
+      raw.copilotIntegrationId,
+      DEFAULT_CONFIG.copilotIntegrationId,
+    ),
+    userAgent: stringOrDefault(raw.userAgent, DEFAULT_CONFIG.userAgent),
+  };
 }
 
 export function saveConfigDefaults(): void {
   ensureDataDir();
   if (existsSync(CONFIG_FILE)) return;
   writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf8');
+}
+
+function stringOrDefault(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
 }
