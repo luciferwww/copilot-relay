@@ -142,6 +142,14 @@ async function handleRequest(
       await proxyChat(rawUrl, body, res, runtime, requestController.signal, trace);
       return;
     }
+    if (method === 'POST' && path === '/v1/responses') {
+      trace.phase = 'request-body';
+      const body = await parseRequestBody(req, 'openai');
+      if (!body || requestController.signal.aborted) return;
+      logReceivedRequest(trace, body.value);
+      await handleResponses(rawUrl, body, res, runtime, requestController.signal, trace);
+      return;
+    }
     if (method === 'POST' && path === '/v1/messages') {
       trace.phase = 'request-body';
       const body = await parseRequestBody(req, 'anthropic');
@@ -220,6 +228,64 @@ async function proxyModels(
     await discardErrorBody(response);
     throw statusFailure(response.status);
   }
+  trace.phase = 'response';
+  await pipePassthrough(response, res, 'openai', signal);
+}
+
+async function handleResponses(
+  rawUrl: string,
+  body: ParsedBody,
+  res: http.ServerResponse,
+  runtime: HttpRuntime,
+  signal: AbortSignal,
+  trace: RequestTrace,
+): Promise<void> {
+  const modelId = requireModelId(body.value);
+  trace.modelId = modelId;
+  trace.route = 'responses-passthrough';
+  trace.endpoint = '/responses';
+  trace.phase = 'catalog';
+  let model = await runtime.catalog.resolve(modelId, signal);
+  const invocation = runtime.transport.createInvocationContext();
+  trace.invocation = invocation;
+  let response: Response;
+
+  while (true) {
+    requireResponsesEndpoint(modelId, model);
+    logPlannedRequest(trace, invocation.replanUsed);
+    trace.phase = 'upstream';
+    response = await runtime.transport.invoke(
+      {
+        endpoint: '/responses',
+        query: queryOf(rawUrl),
+        body: body.raw,
+        accept: acceptsSse(body.value) ? 'text/event-stream' : 'application/json',
+        headers: { 'Openai-Intent': 'conversation-panel' },
+      },
+      signal,
+      invocation,
+    );
+    if (
+      response.status === 400 &&
+      !invocation.replanUsed &&
+      !invocation.downstreamStarted &&
+      (await hasUnsupportedEndpointCode(response))
+    ) {
+      invocation.replanUsed = true;
+      const generation = runtime.catalog.currentGeneration;
+      runtime.catalog.invalidate(generation);
+      trace.phase = 'catalog';
+      model = await runtime.catalog.resolve(modelId, signal, { allowStale: false });
+      continue;
+    }
+    break;
+  }
+
+  if (!response.ok) {
+    await discardErrorBody(response);
+    throw statusFailure(response.status);
+  }
+  invocation.downstreamStarted = true;
   trace.phase = 'response';
   await pipePassthrough(response, res, 'openai', signal);
 }
@@ -607,6 +673,16 @@ function requireModelId(body: Record<string, unknown>): string {
   return body.model;
 }
 
+function requireResponsesEndpoint(modelId: string, model: { supported_endpoints: readonly string[] }): void {
+  if (!model.supported_endpoints.includes('/responses')) {
+    throw failure(
+      400,
+      'invalid_request_error',
+      `Model "${modelId}" does not support the HTTP /responses endpoint.`,
+    );
+  }
+}
+
 function acceptsSse(body: Record<string, unknown>): boolean {
   return body.stream === true;
 }
@@ -674,6 +750,7 @@ function normalizeLogPath(path: string): string {
     '/v1/models',
     '/v1/chat/completions',
     '/chat/completions',
+    '/v1/responses',
     '/v1/messages',
   ].includes(path) ? path : '/other';
 }

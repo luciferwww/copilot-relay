@@ -3,7 +3,8 @@
 Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible** APIs, backed by GitHub Copilot. Lets tools like Claude Code, Codex CLI, etc. reuse your Copilot subscription.
 
 > Status: v0.2. Claude Code can use Copilot models that expose either native
-> Anthropic Messages or HTTP OpenAI Responses. Codex configuration remains a stub.
+> Anthropic Messages or HTTP OpenAI Responses. OpenAI Responses clients can use
+> native `/v1/responses` passthrough. Codex configuration remains a stub.
 
 ## Prerequisites
 
@@ -95,6 +96,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | Route | Description |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
+| `POST /v1/responses` | Capability-checked native OpenAI Responses passthrough (streams supported) |
 | `POST /v1/messages` | Capability-routed native Messages or Responses translation |
 | `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
