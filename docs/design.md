@@ -37,8 +37,8 @@ flowchart LR
     end
 
     A -->|OpenAI/Anthropic format| B
-    B --> J
-    B -->|Native Responses capability check| I
+    B -->|Messages routing| J
+    B -->|Native Responses passthrough| D
     J --> I
     I --> D
     J -->|Messages passthrough| D
@@ -272,7 +272,7 @@ The future store must not turn continuation into a long-term conversation databa
 
 ### 5.1 Source of truth
 
-The live Copilot `/models` response is the sole runtime authority. `1.json` and other captures are test fixtures only and are never loaded by production code. Routing uses only exact entries from `supported_endpoints`; feature preflight uses explicit values from `capabilities.supports` and required bounds from `capabilities.limits`. Model id, family, vendor, picker state, and preview state are not capability signals.
+When the relay chooses a route or validates a translated feature, the live Copilot `/models` response is the sole runtime authority. `1.json` and other captures are test fixtures only and are never loaded by production code. Routing uses only exact entries from `supported_endpoints`; feature preflight uses explicit values from `capabilities.supports` and required bounds from `capabilities.limits`. Model id, family, vendor, picker state, and preview state are not capability signals. Native passthrough routes do not make capability decisions and leave endpoint acceptance to upstream.
 
 Effective support is the intersection of upstream metadata and relay implementation. For example, a model declaring vision is insufficient until the selected translation path implements and validates image mapping.
 
@@ -306,9 +306,9 @@ This union is the boundary that prevents fallback from becoming model substituti
 
 ### 5.4 Native Responses route
 
-Native inbound `POST /v1/responses` is handled beside, not inside, the Messages route planner. The HTTP handler resolves the exact model through `ModelCatalog`, requires exact HTTP `/responses`, and invokes that same endpoint through `CopilotTransport` with the original admitted body. Successful JSON and SSE use the OpenAI passthrough writer; Messages mappers and continuation state are not involved.
+Native inbound `POST /v1/responses` is handled beside, not inside, the Messages route planner. Because the client has already selected the Responses protocol, the handler validates the bounded request and non-empty model id, then invokes upstream `/responses` through `CopilotTransport` with the original admitted body and query. It does not consult `ModelCatalog`. Successful JSON and SSE use the OpenAI passthrough writer; Messages mappers and continuation state are not involved.
 
-The transport owns a pre-output 401 retry. The handler owns verified endpoint rejection: it recognizes only exact HTTP 400 code `unsupported_api_for_model`, invalidates the current catalog generation, requires one non-stale resolution of the same model, and retries `/responses` once only if it remains advertised. Unsupported valid models terminate with OpenAI 400; non-2xx upstream bodies are safely rewritten rather than passed through.
+The transport owns one pre-output 401 retry. Native Responses does not capability-replan or retry an upstream 400; non-2xx upstream bodies are safely rewritten rather than passed through.
 
 ### 5.5 External models route
 
@@ -345,7 +345,7 @@ Unknown ignorable transport fields may be ignored only when `spec.md` explicitly
 
 `CopilotTransport` centralizes behavior currently embedded in `server.proxy()` and `proxyModels()`: proactive token acquisition, common headers, execution of an invocation plan, request deadlines, abort propagation, and returning the upstream `Response` before client headers are committed. It does not parse provider payloads, choose routes, or make a request-scoped controller own shared control-plane work.
 
-One request-scoped attempt coordinator owns both retry reasons and records `authRetryUsed`, `replanUsed`, the auth generation, catalog generation, route, and terminal state for every model invocation attempt. A model invocation is a call to `/chat/completions`, `/v1/messages`, or `/responses` made to generate a client result. No invocation retry is allowed after downstream output starts. Before output starts, an upstream 401 may consume the one auth retry; only HTTP 400 with machine-readable code `unsupported_api_for_model` may consume the one capability re-plan because FR9 verified that exact pair as pre-execution endpoint rejection. A 400 without that code, timeout, connection reset, premature EOF, and any 5xx response are terminal and never replayed.
+One request-scoped attempt coordinator owns retry state and records `authRetryUsed`, `replanUsed`, the auth generation, catalog generation when applicable, route, and terminal state for every model invocation attempt. A model invocation is a call to `/chat/completions`, `/v1/messages`, or `/responses` made to generate a client result. No invocation retry is allowed after downstream output starts. Before output starts, an upstream 401 may consume the one auth retry. For capability-routed Messages only, HTTP 400 with machine-readable code `unsupported_api_for_model` may consume the one capability re-plan because FR9 verified that exact pair as pre-execution endpoint rejection. Native Responses and Chat Completions never capability-replan. A 400 without an applicable re-plan, timeout, connection reset, premature EOF, and any 5xx response are terminal and never replayed.
 
 Each retry reason may be consumed at most once, and an attempt may transition to only one next attempt. The original call plus at most one auth-triggered invocation retry and one verified endpoint re-plan invocation gives a hard maximum of three model invocation attempts per client generation request, regardless of ordering. A repeated reason or any unclassified failure terminates the coordinator. “No downstream bytes” is therefore necessary but not sufficient for replay.
 
@@ -377,7 +377,7 @@ Maps one-to-one to requirement FR3 / FR5 / FR6.
 
 **Do not proxy Copilot's raw error body verbatim.** Rewrite to the target route's protocol:
 
-- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) →
+- OpenAI endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) →
   `{ error: { type, message, code } }`
 - Anthropic endpoint (`/v1/messages`) →
   `{ type: "error", error: { type, message } }`
@@ -416,7 +416,7 @@ The HTTP boundary assigns a process-local request id and emits one terminal info
 - **Safe values are constructed, not scrubbed after formatting**: auth, transport, and protocol layers return typed diagnostic codes plus allowlisted scalar metadata such as HTTP status, model id, cache age, and failure phase. Raw headers, bodies, request payloads, token-exchange payloads, `Error` objects, cause chains, and auth-state objects are not accepted by logger or client-error APIs.
 - **Defense-in-depth redaction**: the output boundary tracks current and replaced credential values and removes complete known values and authorization-header forms from any exceptional fallback string. This is not the primary guarantee: ordinary output paths never receive secret-derived text, so token prefixes and other value-derived fragments cannot be emitted. Persisted diagnostics use the same typed safe representation.
 - **`auth.json` chmod 0600**: applied on Unix-like systems. On Windows no `icacls` call is made — permission relies on the `%USERPROFILE%` directory's own ACL.
-- **Listen on 127.0.0.1 only**: never bind `0.0.0.0`, to prevent LAN clients from using someone else's token. The bind address **has no user-facing configuration hook** — no config.json field, no env var, no CLI flag — only a code change (matches requirement NFR7).
+- **Loopback by default; explicit remote opt-in**: bind `127.0.0.1` unless `host` is configured or supplied by CLI. A non-loopback host is rejected unless that same start command includes `--allow-remote-access`; this acknowledgement is never persisted. Remote listeners have no inbound authentication, so Docker/VM users must provide their own network isolation.
 - **No CORS**: the proxy serves local developer tooling; the browser scenario is out of scope.
 - **Bounded untrusted input**: request bodies, SSE frames, tool arguments, error bodies, and model metadata are subject to limits defined in `spec.md`; limits are checked before unbounded allocation or logging.
 
@@ -438,7 +438,7 @@ Reserved but **not implemented in v0.2**:
 - SSE tests partition identical event bytes at every boundary, combine multiple frames per chunk, split UTF-8 code points, interleave multiple output items according to the probed event table, and reject missing `response.created`, conflicting item keys, incomplete items at response completion, and every undocumented transition.
 - Transport tests use a local fake HTTP server to verify proactive auth, generation-scoped refresh single-flight and commit, per-waiter cancellation, independent manager deadlines, last-waiter abort, stale-result rejection, one 401 retry, definitive-versus-transient refresh classification, exact pre-execution re-plan signals, rejection of ambiguous replay, the three-model-invocation bound, deadline abort, and no downstream bytes before retry decisions complete.
 - Models-route tests verify that external `GET /v1/models` remains byte-for-byte request-owned passthrough, does not join or publish `ModelCatalog` state, and can run concurrently with an independent catalog refresh.
-- Native Responses route tests verify exact capability checks, successful request/JSON/SSE byte preservation, safe non-2xx rewriting, the single verified 400 re-plan, rejection of plain 400 replay, local 400 with no second invocation when refreshed metadata drops `/responses`, and isolation from Messages translation and continuation state.
+- Native Responses route tests verify direct `/responses` invocation without catalog access, successful request/query/JSON/SSE byte preservation, safe non-2xx rewriting without 400 replay, and isolation from Messages translation and continuation state.
 - Lifecycle tests force downstream backpressure and race success, timeout, upstream failure, and client disconnect while asserting one terminal action and complete listener/timer cleanup.
 - End-to-end SDK tests verify observable success and error behavior through `@anthropic-ai/sdk`; live Copilot probes remain a separate acceptance gate and are recorded in `spec.md`.
 - Security tests inject sentinel credentials into auth and upstream failures, then assert that no complete value or substring appears in output surfaces.

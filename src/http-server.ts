@@ -1,5 +1,6 @@
 import http from 'node:http';
 import type { AppConfig } from './config.js';
+import { isLoopbackHost, requireRemoteAccessOptIn } from './bind-policy.js';
 import { AuthManager, AuthManagerError } from './auth/AuthManager.js';
 import { ModelCatalog, ModelCatalogError } from './models/ModelCatalog.js';
 import { planMessagesRoute, type MessagesRoutePlan } from './routing/messages-route.js';
@@ -41,8 +42,9 @@ export interface HttpRuntime {
   readonly registry: ContinuationRegistry;
 }
 
-interface HttpServerOptions {
+export interface HttpServerOptions {
   runtime?: HttpRuntime;
+  allowRemoteAccess?: boolean;
 }
 
 interface ParsedBody {
@@ -73,6 +75,10 @@ export async function startHttpServer(
   cfg: AppConfig,
   options: HttpServerOptions = {},
 ): Promise<HttpServerHandle> {
+  requireRemoteAccessOptIn(cfg.host, options.allowRemoteAccess === true);
+  if (!isLoopbackHost(cfg.host)) {
+    logger.warn('Remote access enabled; the relay listener has no inbound authentication.');
+  }
   const runtime = options.runtime ?? createRuntime(cfg);
   const server = http.createServer((req, res) => {
     handleRequest(req, res, runtime).catch(() => {
@@ -89,11 +95,12 @@ export async function startHttpServer(
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(cfg.port, '127.0.0.1', resolve);
+    server.listen(cfg.port, cfg.host, resolve);
   });
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : cfg.port;
-  logger.info(`copilot-relay listening on http://127.0.0.1:${port}`);
+  const displayHost = cfg.host.includes(':') ? `[${cfg.host}]` : cfg.host;
+  logger.info(`copilot-relay listening on http://${displayHost}:${port}`);
   return {
     port,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
@@ -244,42 +251,21 @@ async function handleResponses(
   trace.modelId = modelId;
   trace.route = 'responses-passthrough';
   trace.endpoint = '/responses';
-  trace.phase = 'catalog';
-  let model = await runtime.catalog.resolve(modelId, signal);
   const invocation = runtime.transport.createInvocationContext();
   trace.invocation = invocation;
-  let response: Response;
-
-  while (true) {
-    requireResponsesEndpoint(modelId, model);
-    logPlannedRequest(trace, invocation.replanUsed);
-    trace.phase = 'upstream';
-    response = await runtime.transport.invoke(
-      {
-        endpoint: '/responses',
-        query: queryOf(rawUrl),
-        body: body.raw,
-        accept: acceptsSse(body.value) ? 'text/event-stream' : 'application/json',
-        headers: { 'Openai-Intent': 'conversation-panel' },
-      },
-      signal,
-      invocation,
-    );
-    if (
-      response.status === 400 &&
-      !invocation.replanUsed &&
-      !invocation.downstreamStarted &&
-      (await hasUnsupportedEndpointCode(response))
-    ) {
-      invocation.replanUsed = true;
-      const generation = runtime.catalog.currentGeneration;
-      runtime.catalog.invalidate(generation);
-      trace.phase = 'catalog';
-      model = await runtime.catalog.resolve(modelId, signal, { allowStale: false });
-      continue;
-    }
-    break;
-  }
+  logPlannedRequest(trace, false);
+  trace.phase = 'upstream';
+  const response = await runtime.transport.invoke(
+    {
+      endpoint: '/responses',
+      query: queryOf(rawUrl),
+      body: body.raw,
+      accept: acceptsSse(body.value) ? 'text/event-stream' : 'application/json',
+      headers: { 'Openai-Intent': 'conversation-panel' },
+    },
+    signal,
+    invocation,
+  );
 
   if (!response.ok) {
     await discardErrorBody(response);
@@ -671,16 +657,6 @@ function requireModelId(body: Record<string, unknown>): string {
     throw failure(400, 'invalid_request_error', 'model must be a non-empty string.');
   }
   return body.model;
-}
-
-function requireResponsesEndpoint(modelId: string, model: { supported_endpoints: readonly string[] }): void {
-  if (!model.supported_endpoints.includes('/responses')) {
-    throw failure(
-      400,
-      'invalid_request_error',
-      `Model "${modelId}" does not support the HTTP /responses endpoint.`,
-    );
-  }
 }
 
 function acceptsSse(body: Record<string, unknown>): boolean {

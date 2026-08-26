@@ -6,6 +6,13 @@ export interface ServerHandle {
   close(): Promise<void>;
 }
 
-export async function startServer(cfg: AppConfig): Promise<ServerHandle> {
-  return await startHttpServer(cfg);
+export interface StartServerOptions {
+  allowRemoteAccess?: boolean;
+}
+
+export async function startServer(
+  cfg: AppConfig,
+  options: StartServerOptions = {},
+): Promise<ServerHandle> {
+  return await startHttpServer(cfg, options);
 }

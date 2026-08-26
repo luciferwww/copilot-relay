@@ -4,6 +4,7 @@ import type { AppConfig } from '../config.js';
 import { AuthManager } from './AuthManager.js';
 
 const CONFIG: AppConfig = {
+  host: '127.0.0.1',
   port: 0,
   logLevel: 'error',
   githubClientId: 'client',
