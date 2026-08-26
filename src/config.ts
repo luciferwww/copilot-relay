@@ -9,6 +9,7 @@ export const CONFIG_FILE = join(DATA_DIR, 'config.json');
 export const PID_FILE = join(DATA_DIR, 'server.pid');
 
 export interface AppConfig {
+  host: string;
   port: number;
   logLevel: LogLevel;
   githubClientId: string;
@@ -19,6 +20,7 @@ export interface AppConfig {
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
+  host: '127.0.0.1',
   port: 5000,
   logLevel: 'info',
   // Well-known community client_id used by open-source Copilot integrations
@@ -53,6 +55,7 @@ export function resolveConfig(value: unknown): AppConfig {
   const raw = value as Record<string, unknown>;
   const logLevel = raw.logLevel;
   return {
+    host: validHostOrDefault(raw.host, DEFAULT_CONFIG.host),
     port: typeof raw.port === 'number' && Number.isInteger(raw.port) ? raw.port : DEFAULT_CONFIG.port,
     logLevel:
       logLevel === 'debug' || logLevel === 'info' || logLevel === 'warn' || logLevel === 'error'
@@ -80,4 +83,15 @@ export function saveConfigDefaults(): void {
 
 function stringOrDefault(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
+}
+
+export function isValidHost(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value === value.trim()
+    && !/[\s\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validHostOrDefault(value: unknown, fallback: string): string {
+  return isValidHost(value) ? value : fallback;
 }

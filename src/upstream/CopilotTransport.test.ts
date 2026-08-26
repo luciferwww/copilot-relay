@@ -5,6 +5,7 @@ import { AuthManager } from '../auth/AuthManager.js';
 import { CopilotTransport } from './CopilotTransport.js';
 
 const CONFIG: AppConfig = {
+  host: '127.0.0.1',
   port: 0,
   logLevel: 'error',
   githubClientId: 'client',

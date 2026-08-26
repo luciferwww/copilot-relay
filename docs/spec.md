@@ -1,18 +1,18 @@
 # copilot-relay — Specification (v0.2)
 
-> Status: approved 2026-08-24; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
+> Status: approved 2026-08-24; amended 2026-08-26; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
 
 ## 1. Scope and invariants
 
-v0.2 preserves the v0.1 CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, and loopback-only server. It adds one conversion path: inbound Anthropic Messages to Copilot HTTP `/responses`.
+v0.2 preserves the v0.1 CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, and loopback-only server. It adds inbound Anthropic Messages to Copilot HTTP `/responses` translation and native OpenAI Responses passthrough.
 
 The following invariants are mandatory:
 
-- The exact inbound model id is used for catalog lookup and every model invocation. The relay never substitutes a model.
-- Live Copilot `/models` metadata is the only runtime capability authority. Captures such as `1.json` are fixtures only.
+- The exact inbound model id is used for every model invocation and for catalog lookup on capability-routed requests. The relay never substitutes a model.
+- When the relay makes a capability decision, live Copilot `/models` metadata is the only runtime authority. Captures such as `1.json` are fixtures only; native passthrough routes do not make capability decisions.
 - Endpoint priority for `POST /v1/messages` is exact `/v1/messages`, then exact `/responses`. `ws:/responses` is not HTTP `/responses`.
 - Every translated request is completely validated before the first model invocation.
-- Responses requests always set `store: false` and never send `previous_response_id`.
+- Translated Responses requests always set `store: false` and never send `previous_response_id`; native Responses requests preserve those client fields.
 - No retry or re-plan occurs after the first downstream response byte.
 - Raw upstream bodies, headers, errors, credentials, image data, and credential-derived substrings never reach logs, CLI output, persisted diagnostics, or client errors.
 - Request fields, content variants, upstream items, and SSE events not admitted by this specification fail closed.
@@ -61,6 +61,7 @@ On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written
 
 ```typescript
 interface AppConfig {
+  host: string;
   port: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   githubClientId: string;
@@ -71,7 +72,7 @@ interface AppConfig {
 }
 ```
 
-Defaults remain those in `src/config.ts`. There is no host field; the server binds only `127.0.0.1`.
+Defaults remain those in `src/config.ts`; `host` defaults to `127.0.0.1`. Configuration accepts a non-empty host without whitespace or control characters. The remote-access acknowledgement is deliberately absent from `AppConfig` and cannot be persisted.
 
 ### 3.3 Auth schema
 
@@ -109,7 +110,7 @@ CLI exit code `0` means success, `1` means failure, and `2` means unimplemented.
 | `login [--no-open]` | Run GitHub device-code login, optionally open the verification URL, exchange the access token, and persist auth |
 | `logout` | Delete `auth.json`; missing file is success |
 | `status` | Print only the safe fields in §3.3; always exit `0` |
-| `start [--port N] [--log-level L]` | Require login, run foreground on `127.0.0.1`, own the PID file, and clean up on `SIGINT`/`SIGTERM` |
+| `start [--host H] [--port N] [--log-level L] [--allow-remote-access]` | Require login, validate the bind policy before listening, run in the foreground, own the PID file, and clean up on `SIGINT`/`SIGTERM` |
 | `stop` | Signal the recorded PID; missing/stale PID is cleaned up and treated as success |
 | `config-show` | Create defaults when absent and print path plus config JSON without interleaved logs |
 | `configure claude [--port N]` | Merge `ANTHROPIC_BASE_URL`; preserve an existing `ANTHROPIC_AUTH_TOKEN`, otherwise write the dummy value; preserve peer settings |
@@ -122,12 +123,15 @@ The HTTP server exposes:
 | `GET /health` | `200 application/json`, `{"ok":true}` |
 | `GET /v1/models` | Independent request-owned byte-for-byte upstream passthrough |
 | `POST /v1/chat/completions` and `/chat/completions` | Existing Chat Completions passthrough |
+| `POST /v1/responses` | Bounded thin passthrough to upstream `/responses` |
 | `POST /v1/messages` | Capability-routed native passthrough or Responses translation |
 | Other | `404` local OpenAI-shaped error |
 
-Successful native `/v1/messages`, Chat Completions, and external `/v1/models` bodies and streams remain byte-for-byte passthrough. The external models route neither reads nor publishes `ModelCatalog` state and may run concurrently with a separate internal refresh.
+Successful native `/v1/responses`, native `/v1/messages`, Chat Completions, and external `/v1/models` bodies and streams remain byte-for-byte passthrough. Non-2xx bodies are never byte-for-byte passthrough. The external models route neither reads nor publishes `ModelCatalog` state and may run concurrently with a separate internal refresh.
 
-Native Messages passthrough forwards inbound `anthropic-version` (default `2023-06-01`) and optional `anthropic-beta`. Translated `/responses` calls do not forward Anthropic headers; they send Bearer authorization, JSON content type, configured Copilot client headers, `Copilot-Integration-Id`, `Openai-Intent: conversation-panel`, and `Accept: application/json` or `text/event-stream` according to `stream`.
+`127.0.0.0/8`, `::1`, its full IPv6 spelling, and `localhost` are loopback hosts. Every other host is remote for policy purposes, including wildcard addresses, interface addresses, and non-local DNS names. `startHttpServer` rejects a remote host before creating a listener unless its invocation receives `allowRemoteAccess: true`; the CLI supplies that value only from the current `--allow-remote-access` flag. A remote start emits a warning that the listener has no inbound authentication. Invalid configured hosts fall back to the default; an invalid explicit `--host` fails startup.
+
+Native Messages passthrough forwards inbound `anthropic-version` (default `2023-06-01`) and optional `anthropic-beta`. Translated and native `/responses` calls do not forward Anthropic headers; they send Bearer authorization, JSON content type, configured Copilot client headers, `Copilot-Integration-Id`, `Openai-Intent: conversation-panel`, and `Accept: application/json` or `text/event-stream` according to `stream`.
 
 ### 4.1 Inbound POST body contract
 
@@ -181,6 +185,8 @@ One generation request has `authRetryUsed`, `replanUsed`, auth generation, catal
 4. Each reason is consumed at most once. The original plus both distinct retries yields at most three model invocations.
 5. Plain 400, timeout, reset, premature EOF, malformed error body, 5xx, repeated reason, or any failure after downstream output is terminal.
 
+Step 3 applies only to capability-routed Messages. Native Responses does not use the catalog or capability re-plan; `CopilotTransport` may apply only step 2 to that route.
+
 Token exchanges, catalog refreshes, route planning, and external `/v1/models` calls do not consume this count. External `/v1/models` has only its own one-401 retry.
 
 ## 6. Live ModelCatalog and route planning
@@ -202,8 +208,8 @@ Records with a valid id but no `supported_endpoints` field are retained in a gen
 - Empty or expired cache starts or joins one manager-owned refresh.
 - A model miss may reuse only `(modelId, currentGeneration)`. Otherwise one refresh is attempted and the resulting miss is recorded for that generation.
 - Ordinary refresh failure may use an existing snapshot no older than 60 minutes. The safe log records only age and status.
-- Refresh forced by verified endpoint rejection must publish a generation newer than the rejected snapshot; failure returns Anthropic 502 without stale fallback.
-- Without bounded-stale data, refresh failure is Anthropic 502.
+- Refresh forced by verified endpoint rejection must publish a generation newer than the rejected snapshot; failure returns a 502 in the calling route's protocol shape without stale fallback.
+- Without bounded-stale data, refresh failure returns a 502 in the calling route's protocol shape.
 - The catalog manager uses the same independent-waiter, last-waiter abort, one-terminal-section, and generation-safe commit rules as the Auth Manager.
 
 ### 6.3 Route plan
@@ -216,6 +222,12 @@ For the exact requested model:
 4. Missing/malformed required metadata produces Anthropic 502.
 
 Feature support is the intersection of explicit metadata and this spec. Tools require `supports.tool_calls === true`; parallel calls require `supports.parallel_tool_calls === true`; streaming requires `supports.streaming === true`; images require `supports.vision === true` plus the vision limits in §7.4.
+
+### 6.4 Native Responses route
+
+Exact inbound `POST /v1/responses` requires a non-empty string `model` and invokes upstream `/responses` directly. It does not read or mutate `ModelCatalog`; upstream determines whether the model exists and accepts that endpoint. Upstream 400 responses are terminal and are not capability-replanned.
+
+The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
 
 ## 7. Closed Messages request mapping
 
@@ -549,5 +561,6 @@ The implementation files and ownership boundaries are those listed in `design.md
 - Output tests reject non-streaming and streaming incomplete responses that contain any function call, and admit text-only `max_output_tokens` completion.
 - SSE tests partition fixture bytes at every boundary, combine frames, split UTF-8 code points, enforce every transition in §10, reject interleaving and cumulative text overflow, verify backpressure, and assert exact terminal usage frames.
 - Route tests prove external models passthrough isolation and successful native body/stream byte preservation.
+- Native Responses route tests prove exact dispatch without catalog access, request/query and successful JSON/SSE byte preservation, safe non-2xx rewriting with no 400 retry, and no Messages translation or continuation access.
 - Security tests inject sentinel credentials into every failure surface and assert that no complete credential or substring appears.
 - SDK end-to-end tests verify translated non-streaming, streaming, tool continuation, max-token completion, and mid-stream errors with `@anthropic-ai/sdk`.

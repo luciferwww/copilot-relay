@@ -3,7 +3,8 @@
 Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible** APIs, backed by GitHub Copilot. Lets tools like Claude Code, Codex CLI, etc. reuse your Copilot subscription.
 
 > Status: v0.2. Claude Code can use Copilot models that expose either native
-> Anthropic Messages or HTTP OpenAI Responses. Codex configuration remains a stub.
+> Anthropic Messages or HTTP OpenAI Responses. OpenAI Responses clients can use
+> native `/v1/responses` passthrough. Codex configuration remains a stub.
 
 ## Prerequisites
 
@@ -68,6 +69,21 @@ copilot-relay configure claude --port 5001
 Or set it once in `~/.copilot-relay/config.json` so every future run picks it
 up (see [Config file](#config-file) below).
 
+### Docker, virtual machines, and remote access
+
+The relay binds to `127.0.0.1` by default. To expose it through a container or
+virtual-machine network, choose a host and explicitly acknowledge that the
+listener has no inbound authentication:
+
+```powershell
+copilot-relay start --host 0.0.0.0 --allow-remote-access
+```
+
+`host` may be stored in `~/.copilot-relay/config.json`, but
+`--allow-remote-access` is never persisted and is required on every start that
+uses a non-loopback host. Restrict the published port with container, firewall,
+or virtual-network rules; do not expose it directly to an untrusted network.
+
 ## Update / uninstall
 
 ```powershell
@@ -84,7 +100,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | `copilot-relay login` | GitHub device-code flow; stores tokens under `~/.copilot-relay/` |
 | `copilot-relay logout` | Delete stored credentials |
 | `copilot-relay status` | Show current config + token state |
-| `copilot-relay start [--port N] [--log-level L]` | Start proxy in foreground |
+| `copilot-relay start [--host H] [--port N] [--log-level L] [--allow-remote-access]` | Start proxy in foreground; non-loopback hosts require explicit acknowledgement |
 | `copilot-relay stop` | Send SIGTERM to a foreground server via pid file |
 | `copilot-relay configure claude` | Write `~/.claude/settings.json` to point Claude Code at this proxy |
 | `copilot-relay configure codex` | Unimplemented; exits with code `2` |
@@ -95,6 +111,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | Route | Description |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
+| `POST /v1/responses` | Native OpenAI Responses thin passthrough (streams supported) |
 | `POST /v1/messages` | Capability-routed native Messages or Responses translation |
 | `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
@@ -105,6 +122,7 @@ Stored at `~/.copilot-relay/config.json`. Missing keys fall back to defaults def
 
 Notable fields:
 
+- `host` — listen address, default `127.0.0.1`; a non-loopback value still requires `--allow-remote-access` on every start.
 - `githubClientId` — OAuth client id used for device flow. Default is a well-known community value; override with your own OAuth App id if desired.
 - `editorVersion`, `editorPluginVersion`, `copilotIntegrationId`, `userAgent` — headers sent to `api.githubcopilot.com`. Adjust if Copilot backend rejects the request.
 
@@ -112,3 +130,8 @@ Notable fields:
 
 - This code is a **from-scratch reimplementation** of the public parts of the GitHub Copilot HTTP protocol, written for personal use.
 - GitHub Copilot subscription terms apply. Do not redistribute your Copilot token.
+
+## Contributors
+
+- [@xlight](https://github.com/xlight) — proposed and first implemented native
+  `POST /v1/responses` support in [PR #1](https://github.com/luciferwww/copilot-relay/pull/1).

@@ -4,6 +4,7 @@ export type RequestRoute =
   | 'health'
   | 'models-passthrough'
   | 'chat-passthrough'
+  | 'responses-passthrough'
   | 'messages-passthrough'
   | 'responses-translation'
   | 'not-found';

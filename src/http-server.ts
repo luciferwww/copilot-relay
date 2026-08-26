@@ -1,5 +1,6 @@
 import http from 'node:http';
 import type { AppConfig } from './config.js';
+import { isLoopbackHost, requireRemoteAccessOptIn } from './bind-policy.js';
 import { AuthManager, AuthManagerError } from './auth/AuthManager.js';
 import { ModelCatalog, ModelCatalogError } from './models/ModelCatalog.js';
 import { planMessagesRoute, type MessagesRoutePlan } from './routing/messages-route.js';
@@ -41,8 +42,9 @@ export interface HttpRuntime {
   readonly registry: ContinuationRegistry;
 }
 
-interface HttpServerOptions {
+export interface HttpServerOptions {
   runtime?: HttpRuntime;
+  allowRemoteAccess?: boolean;
 }
 
 interface ParsedBody {
@@ -73,6 +75,10 @@ export async function startHttpServer(
   cfg: AppConfig,
   options: HttpServerOptions = {},
 ): Promise<HttpServerHandle> {
+  requireRemoteAccessOptIn(cfg.host, options.allowRemoteAccess === true);
+  if (!isLoopbackHost(cfg.host)) {
+    logger.warn('Remote access enabled; the relay listener has no inbound authentication.');
+  }
   const runtime = options.runtime ?? createRuntime(cfg);
   const server = http.createServer((req, res) => {
     handleRequest(req, res, runtime).catch(() => {
@@ -89,11 +95,12 @@ export async function startHttpServer(
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(cfg.port, '127.0.0.1', resolve);
+    server.listen(cfg.port, cfg.host, resolve);
   });
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : cfg.port;
-  logger.info(`copilot-relay listening on http://127.0.0.1:${port}`);
+  const displayHost = cfg.host.includes(':') ? `[${cfg.host}]` : cfg.host;
+  logger.info(`copilot-relay listening on http://${displayHost}:${port}`);
   return {
     port,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
@@ -140,6 +147,14 @@ async function handleRequest(
       if (!body || requestController.signal.aborted) return;
       logReceivedRequest(trace, body.value);
       await proxyChat(rawUrl, body, res, runtime, requestController.signal, trace);
+      return;
+    }
+    if (method === 'POST' && path === '/v1/responses') {
+      trace.phase = 'request-body';
+      const body = await parseRequestBody(req, 'openai');
+      if (!body || requestController.signal.aborted) return;
+      logReceivedRequest(trace, body.value);
+      await handleResponses(rawUrl, body, res, runtime, requestController.signal, trace);
       return;
     }
     if (method === 'POST' && path === '/v1/messages') {
@@ -220,6 +235,43 @@ async function proxyModels(
     await discardErrorBody(response);
     throw statusFailure(response.status);
   }
+  trace.phase = 'response';
+  await pipePassthrough(response, res, 'openai', signal);
+}
+
+async function handleResponses(
+  rawUrl: string,
+  body: ParsedBody,
+  res: http.ServerResponse,
+  runtime: HttpRuntime,
+  signal: AbortSignal,
+  trace: RequestTrace,
+): Promise<void> {
+  const modelId = requireModelId(body.value);
+  trace.modelId = modelId;
+  trace.route = 'responses-passthrough';
+  trace.endpoint = '/responses';
+  const invocation = runtime.transport.createInvocationContext();
+  trace.invocation = invocation;
+  logPlannedRequest(trace, false);
+  trace.phase = 'upstream';
+  const response = await runtime.transport.invoke(
+    {
+      endpoint: '/responses',
+      query: queryOf(rawUrl),
+      body: body.raw,
+      accept: acceptsSse(body.value) ? 'text/event-stream' : 'application/json',
+      headers: { 'Openai-Intent': 'conversation-panel' },
+    },
+    signal,
+    invocation,
+  );
+
+  if (!response.ok) {
+    await discardErrorBody(response);
+    throw statusFailure(response.status);
+  }
+  invocation.downstreamStarted = true;
   trace.phase = 'response';
   await pipePassthrough(response, res, 'openai', signal);
 }
@@ -674,6 +726,7 @@ function normalizeLogPath(path: string): string {
     '/v1/models',
     '/v1/chat/completions',
     '/chat/completions',
+    '/v1/responses',
     '/v1/messages',
   ].includes(path) ? path : '/other';
 }

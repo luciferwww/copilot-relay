@@ -1,6 +1,6 @@
 # copilot-relay — Requirements (v0.2)
 
-> Status: approved 2026-08-21; amended 2026-08-21. v0.1 behavior remains supported unless this document explicitly changes it.
+> Status: approved 2026-08-21; amended 2026-08-26. v0.1 behavior remains supported unless this document explicitly changes it.
 
 ## 1. Background
 
@@ -17,7 +17,7 @@ v0.1 forwards each client protocol to the matching Copilot endpoint. This fails 
 
 ## 2. Goals
 
-- **G1.** Provide a local HTTP service exposing OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`) APIs, backed by GitHub Copilot.
+- **G1.** Provide a local HTTP service exposing OpenAI-compatible (`/v1/chat/completions`, `/v1/responses`) and Anthropic-compatible (`/v1/messages`) APIs, backed by GitHub Copilot.
 - **G2.** Run independently of VS Code: no dependency on the `vscode` module or the Copilot Chat extension. Pure Node.js CLI.
 - **G3.** Support streaming responses (SSE).
 - **G4.** Support the GitHub device-code login flow; own and auto-refresh the short-lived Copilot token.
@@ -30,7 +30,7 @@ v0.1 forwards each client protocol to the matching Copilot endpoint. This fails 
 - **N2.** No telemetry or usage reporting.
 - **N3.** No automatic version check or auto-update.
 - **N4.** No graphical UI.
-- **N5.** No inbound authentication (API key / mTLS / etc.); the relay relies on loopback isolation to guarantee that only local processes can reach the proxy (see NFR7).
+- **N5.** No inbound authentication (API key / mTLS / etc.). Loopback isolation remains the default; a user who explicitly enables remote access accepts responsibility for protecting the exposed listener (see NFR7).
 - **N6.** No general-purpose protocol conversion matrix. v0.2 does not translate Chat Completions to Messages, Chat Completions to Responses, or Responses client requests to another protocol.
 - **N7.** No automatic model substitution. Endpoint routing may change the protocol used to invoke the requested model, but never changes the requested model id.
 - **N8.** v0.2 does not translate PDF/document blocks, URL image sources, images embedded in tool results, more than one base64 image block per request, Anthropic extended-thinking blocks, prompt-caching semantics, `top_k`, or non-empty `stop_sequences`.
@@ -52,6 +52,8 @@ A future release must provide finite statelessness at the process boundary: sess
 - **US5.** I want `copilot-relay status` to quickly show the current auth state and token expiry.
 - **US6.** As a Claude Code user, I want to select a Copilot model that supports `/responses` and use it without changing Claude Code's Anthropic API configuration.
 - **US7.** As a user, I want unsupported content or model capabilities to fail explicitly instead of being silently dropped or routed to a different model.
+- **US8.** As an OpenAI Responses client, I want to call a Copilot model through native `/v1/responses` without protocol translation.
+- **US9.** As a Docker or virtual-machine user, I want to bind the relay to a non-loopback interface only when I explicitly acknowledge that the unauthenticated listener will be remotely reachable.
 
 ## 5. Functional Requirements
 
@@ -62,19 +64,20 @@ A future release must provide finite statelessness at the process boundary: sess
 | `copilot-relay login` | ✅ |
 | `copilot-relay logout` | ✅ |
 | `copilot-relay status` | ✅ |
-| `copilot-relay start [--port] [--log-level]` | ✅ |
+| `copilot-relay start [--host] [--port] [--log-level] [--allow-remote-access]` | ✅ |
 | `copilot-relay stop` | ✅ |
 | `copilot-relay config-show` | ✅ |
 | `copilot-relay configure claude` | ✅ |
 | `copilot-relay configure codex` | ⏳ v0.2 |
 
-> Default listen port is `5000`, overridable with `--port`. The listen address is fixed at `127.0.0.1` (see NFR7).
+> Default listen port is `5000`, overridable with `--port`. The default listen address is `127.0.0.1`. A non-loopback `host` additionally requires `--allow-remote-access` on every start (see NFR7).
 
 ### FR2. HTTP Routes
 
 | Route | Required |
 |---|---|
 | `POST /v1/chat/completions` (OpenAI; streaming supported) | ✅ |
+| `POST /v1/responses` (OpenAI Responses; native passthrough; streaming supported) | ✅ |
 | `POST /v1/messages` (Anthropic; streaming supported; capability-routed in v0.2) | ✅ |
 | `GET /v1/models` (proxied from upstream) | ✅ |
 | `GET /health` | ✅ |
@@ -97,7 +100,7 @@ A future release must provide finite statelessness at the process boundary: sess
 
 Errors returned by upstream Copilot must be rewritten to match the client's protocol shape:
 
-- OpenAI endpoints (`/v1/chat/completions`, `/v1/models`) return
+- OpenAI endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) return
   `{ error: { type, message, code } }`.
 - Anthropic endpoint (`/v1/messages`) returns
   `{ type: "error", error: { type, message } }`.
@@ -168,6 +171,12 @@ The process-local storage rule above is the current v0.2 implementation limit, n
 
 Before v0.2 implementation is considered complete, the Copilot `/responses` endpoint must be verified with the selected subscription using probes for non-streaming text, streaming text, request-level reasoning effort, streaming tool use, the following tool-result continuation turn, and base64 image input. The compatibility record must also preserve the observed rejection of external URL images. The probes must establish the accepted request-field names; observed completion, usage, tool-call, and error shapes; which exact endpoint-availability statuses or machine-readable codes guarantee rejection before model execution; and whether continuation requires response ids, function-call ids, completed output items, reasoning items or encrypted reasoning content, `previous_response_id`, `store`, or other opaque upstream state. For streaming output, state captured from an added/in-progress event must not be assumed complete unless the probe demonstrates it; completed item events must be tested separately. The observed payload and event shapes must be recorded in `spec.md`; implementation must follow observed Copilot behavior when it differs from the public OpenAI Responses shape. Public OpenAI documentation is a baseline, not evidence that Copilot accepts an unprobed field or event variant.
 
+### FR10. Native OpenAI Responses Passthrough
+
+Exact inbound `POST /v1/responses` is a bounded thin passthrough to upstream `/responses`. It requires a non-empty model id but does not consult `ModelCatalog`: the client has already selected the protocol and endpoint, so upstream remains authoritative for whether that model accepts `/responses`. Successful request and response bodies are passed through without protocol translation or participation in Messages continuation state. Non-2xx upstream bodies are bounded and safely rewritten rather than forwarded.
+
+`CopilotTransport` owns the single pre-output 401 auth retry. Native Responses never performs capability re-planning, switches model or endpoint, or retries an upstream 400.
+
 ## 6. Non-Functional Requirements
 
 - **NFR1 — Platform:** Windows / macOS / Linux fully supported, Node.js ≥ 18 (for native `fetch`).
@@ -176,15 +185,15 @@ Before v0.2 implementation is considered complete, the Copilot `/responses` endp
 - **NFR4 — Proxy overhead and resource bounds:** Passthrough routes must not buffer streaming responses. Translation routes must process SSE incrementally and must not buffer the complete response or complete event stream. Buffering one incomplete SSE frame, one partial tool-argument value, bounded continuation state, and bounded parser state is allowed. Request bodies, non-streaming responses, SSE frames, tool arguments, model metadata, error bodies, and continuation entries must have explicit limits and timeout/expiry behavior in `spec.md`. Streaming writes must respect downstream backpressure. No specific time-to-first-byte threshold is defined.
 - **NFR5 — Security & logging:** `auth.json` has restrictive permissions. Access tokens, Copilot tokens, authorization headers, every token substring, prompt text, system text, tool input/result values, image data, raw request/response bodies, and raw errors must never appear in logs, CLI output, or client-facing errors at any log level. Authentication status may expose only non-secret state and expiry metadata. Default info logs record an allowlisted request lifecycle summary including request id, method/path, model id when available, route/endpoint, status, duration, and failure phase. Debug logs may additionally record only structural counts and enums such as message roles/content kinds/block counts, stream/tools counts, and retry/re-plan state. Logs go to stdout only — no file, no rotation.
 - **NFR6 — Portability:** 100% TypeScript. A single `tsc` build produces artifacts runnable via `node dist/cli.js`; no loader or bundler is used.
-- **NFR7 — Bind address:** Listen on `127.0.0.1` only. `0.0.0.0` and external IPs are not supported; other hosts on the same LAN must be unable to connect. `host` is not exposed as a configurable field (no override via `config.json`, environment variable, or CLI flag). LAN access is out of scope; fork the project if needed.
+- **NFR7 — Bind address:** Listen on `127.0.0.1` by default. `host` may be set in `config.json` or with `--host` for Docker, virtual-machine, and similar networking. Starting with any non-loopback host, including `0.0.0.0` or `::`, must fail unless that same invocation includes `--allow-remote-access`. The acknowledgement is CLI-only, is never persisted, and must be supplied on every remote start because the listener has no inbound authentication.
 
 ## 7. Constraints and Assumptions
 
 - **A1.** The Copilot HTTP protocol (`api.githubcopilot.com`) request-header format is assumed stable within the project's development window. If upstream changes, header values (`Editor-Version`, etc.) are configurable and require no code changes.
 - **A2.** The default `githubClientId` uses the widely-used public value found in existing community open-source Copilot clients. Users can substitute their own OAuth App id.
-- **A3.** The live Copilot models response is the sole runtime source of truth for model existence, endpoint routing, declared feature support, and advertised limits. Effective support is the intersection of that metadata and relay functionality. Missing or malformed required metadata is handled as specified in FR7; no model-name, family, vendor, preview-state, or bundled-snapshot inference is allowed.
+- **A3.** When the relay makes a routing or translated-feature decision, the live Copilot models response is the sole runtime source of truth for model existence, endpoint routing, declared feature support, and advertised limits. Effective support is the intersection of that metadata and relay functionality. Missing or malformed required metadata is handled as specified in FR7; no model-name, family, vendor, preview-state, or bundled-snapshot inference is allowed. Native passthrough routes leave endpoint acceptance to upstream.
 - **A4.** Copilot's `/responses` payload and SSE shapes are expected to be sufficiently compatible with the public OpenAI Responses API to support the mapping in FR8. FR9 must verify this assumption before implementation is accepted.
-- **C1.** Users must comply with the GitHub Copilot subscription terms. Tokens must not be shared, and the project must not be used for unauthorized commercial resale. NFR7's loopback-only binding is a technical safeguard against LAN-local token misuse, but overall compliance responsibility rests with the user.
+- **C1.** Users must comply with the GitHub Copilot subscription terms. Tokens must not be shared, and the project must not be used for unauthorized commercial resale. NFR7's loopback default and per-start remote-access acknowledgement reduce accidental exposure, but a user who enables remote access remains responsible for network isolation and overall compliance.
 
 ## 8. Acceptance Criteria
 
@@ -209,3 +218,5 @@ Before v0.2 implementation is considered complete, the Copilot `/responses` endp
 - **AC13.** Unit tests cover request mapping, VS Code system-text message validation, request-level reasoning-effort validation against live model metadata, non-streaming response mapping, local URL-image rejection and base64-image validation, supported tool-choice and parallel-tool controls, continuation identity and expiry, completed reasoning/output-item capture, SSE frames split across arbitrary transport chunks, multiple frames in one chunk, tool-argument deltas, malformed upstream events, bounded buffers and metadata, downstream backpressure, abort/error/timeout races, external `/v1/models` passthrough isolation from catalog refresh, model lookup refresh, generation-scoped negative results, shared concurrent refresh with per-waiter cancellation, independent control-plane deadlines, last-waiter abort, bounded-stale cache use, the exact `400` plus `unsupported_api_for_model` pre-execution re-plan signal, rejection of ambiguous replay, missing or malformed `supported_endpoints`, missing required feature limits, token-refresh failure classification, and the intersection of model-declared and relay-implemented capabilities.
 - **AC14.** Automated tests use sentinel credentials and verify that no complete credential or credential substring appears in `status` output, persisted diagnostic state, logs at any level, HTTP errors, or thrown-error messages.
 - **AC15.** With the default info level, each HTTP request produces a correlated terminal log containing only the allowlisted lifecycle fields from NFR5. Debug mode additionally exposes enough structural metadata to distinguish message-role/content-shape failures without logging any content value. Tests cover success, local validation failure, upstream failure, and credential/content sentinels.
+- **AC16.** Native `POST /v1/responses` preserves the admitted request bytes, query string, and successful JSON/SSE response bytes; invokes upstream `/responses` without catalog access or capability re-planning; returns the FR10 OpenAI errors; safely rewrites non-2xx upstream bodies; and never enters Messages translation or continuation handling.
+- **AC17.** `start` binds to `127.0.0.1` by default. A loopback `--host` starts without acknowledgement; a non-loopback host from either `config.json` or `--host` fails before listening unless the same command includes `--allow-remote-access`. The acknowledgement is not a config field and is not persisted.

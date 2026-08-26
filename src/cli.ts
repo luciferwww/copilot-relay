@@ -3,7 +3,15 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from '
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { Command } from 'commander';
-import { AUTH_FILE, CONFIG_FILE, PID_FILE, loadConfig, saveConfigDefaults } from './config.js';
+import {
+  AUTH_FILE,
+  CONFIG_FILE,
+  PID_FILE,
+  isValidHost,
+  loadConfig,
+  saveConfigDefaults,
+} from './config.js';
+import { RemoteAccessRequiredError, requireRemoteAccessOptIn } from './bind-policy.js';
 import { logger, setLevel, type LogLevel } from './logger.js';
 import { loginWithDeviceCode } from './auth/deviceCode.js';
 import { AUTH_REFRESH_TIMEOUT_MS } from './auth/AuthManager.js';
@@ -25,13 +33,36 @@ program
 program
   .command('start')
   .description('Start the proxy server in the foreground.')
+  .option('-H, --host <host>', 'Address to bind (default: 127.0.0.1)')
   .option('-p, --port <port>', 'Port to listen on', (v) => parseInt(v, 10))
   .option('-l, --log-level <level>', 'debug|info|warn|error')
-  .action(async (opts: { port?: number; logLevel?: LogLevel }) => {
+  .option('--allow-remote-access', 'Acknowledge unauthenticated non-loopback access')
+  .action(async (opts: {
+    host?: string;
+    port?: number;
+    logLevel?: LogLevel;
+    allowRemoteAccess?: boolean;
+  }) => {
     const cfg = loadConfig();
+    if (opts.host !== undefined) {
+      if (!isValidHost(opts.host)) {
+        logger.error('Invalid host. Use a non-empty address without whitespace.');
+        process.exit(1);
+      }
+      cfg.host = opts.host;
+    }
     if (opts.port) cfg.port = opts.port;
     if (opts.logLevel) cfg.logLevel = opts.logLevel;
     setLevel(cfg.logLevel);
+    try {
+      requireRemoteAccessOptIn(cfg.host, opts.allowRemoteAccess === true);
+    } catch (error) {
+      if (error instanceof RemoteAccessRequiredError) {
+        logger.error(error.message);
+        process.exit(1);
+      }
+      throw error;
+    }
     if (!loadAuth()) {
       logger.error('Not logged in. Run `copilot-relay login` first.');
       process.exit(1);
@@ -67,7 +98,7 @@ program
     writeFileSync(PID_FILE, String(process.pid), 'utf8');
     let handle;
     try {
-      handle = await startServer(cfg);
+      handle = await startServer(cfg, { allowRemoteAccess: opts.allowRemoteAccess === true });
     } catch (error) {
       try {
         unlinkSync(PID_FILE);
