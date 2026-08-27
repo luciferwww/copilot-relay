@@ -121,13 +121,14 @@ test('request mapper accepts the narrow Claude Code request envelope', () => {
   });
 });
 
-test('request mapper emits Copilot tool definitions without a type field', () => {
+test('request mapper maps an explicit Anthropic custom tool to a Copilot function tool', () => {
   const mapped = mapMessagesRequest(
     {
       model: 'gpt-test',
       max_tokens: 32,
       messages: [{ role: 'user', content: 'search the web' }],
       tools: [{
+        type: 'custom',
         name: 'WebSearch',
         description: 'Search the web',
         input_schema: {
@@ -141,6 +142,7 @@ test('request mapper emits Copilot tool definitions without a type field', () =>
   );
 
   assert.deepEqual(mapped.body.tools, [{
+    type: 'function',
     name: 'WebSearch',
     description: 'Search the web',
     parameters: {
@@ -149,9 +151,24 @@ test('request mapper emits Copilot tool definitions without a type field', () =>
       required: ['query'],
     },
   }]);
-  assert.equal('type' in (mapped.body.tools as Record<string, unknown>[])[0], false);
   assert.equal(mapped.body.tool_choice, 'auto');
   assert.equal(mapped.body.parallel_tool_calls, true);
+});
+
+test('request mapper rejects Anthropic server tools that cannot run through Copilot', () => {
+  assert.throws(
+    () => mapMessagesRequest(
+      {
+        model: 'gpt-test',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: 'search the web' }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      },
+      createContext(),
+    ),
+    (error: unknown) => error instanceof TranslationError &&
+      error.failure.message === 'Only custom tools are supported.',
+  );
 });
 
 test('request mapper maps VS Code system messages in place', () => {

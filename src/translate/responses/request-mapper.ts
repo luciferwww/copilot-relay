@@ -249,11 +249,15 @@ function mapTools(
   const names = new Set<string>();
   output.tools = toolsValue.map((entry) => {
     const tool = requireRecord(entry, 'tool');
-    rejectUnknownFields(tool, new Set(['name', 'description', 'input_schema']), 'tool');
+    rejectUnknownFields(tool, new Set(['type', 'name', 'description', 'input_schema']), 'tool');
+    if (tool.type !== undefined && tool.type !== 'custom') {
+      invalid('Only custom tools are supported.');
+    }
     const name = requireNonEmptyString(tool.name, 'tool.name');
     if (names.has(name)) invalid(`Tool name "${name}" is duplicated.`);
     names.add(name);
     const mapped: Record<string, unknown> = {
+      type: 'function',
       name,
       parameters: requireRecord(tool.input_schema, 'tool.input_schema'),
     };

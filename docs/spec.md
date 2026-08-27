@@ -272,7 +272,7 @@ For each represented group, every tool id must resolve to that unexpired group, 
 
 ### 7.3 Tools and tool choice
 
-An absent or empty Anthropic tools array produces no Responses tool fields; `tool_choice` remains invalid without a non-empty tools array. Each entry of a non-empty array `{name, description?, input_schema}` maps to Copilot's flat tool definition `{name, description?, parameters:input_schema}`. The public Responses tool discriminator `type:'function'` is not sent because the verified Copilot endpoint rejects `type` as an unknown tool field. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
+An absent or empty Anthropic tools array produces no Responses tool fields; `tool_choice` remains invalid without a non-empty tools array. Each custom entry `{type?:'custom', name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`. The explicit Anthropic `type:'custom'` discriminator and its legacy omission are equivalent. Anthropic server-tool types such as `web_search_20250305` are rejected because Copilot cannot execute those Anthropic-hosted tools. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
 
 | Anthropic `tool_choice.type` | Responses `tool_choice` |
 |---|---|
@@ -485,7 +485,7 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 - Explicit default sampling `temperature:1` and `top_p:0.98` succeeded; tested non-default values were rejected.
 - `max_output_tokens:15` was rejected; `16` was accepted and could return incomplete with reason `max_output_tokens`.
 - Function choice, `none`, parallel calls, argument deltas, and stateless tool continuation succeeded.
-- Copilot tool definitions used the flat `{name, description?, parameters}` shape; sending the public Responses `type:'function'` discriminator was observed to fail with `400 Unknown tool field "type"`.
+- Copilot tool definitions used the flat Responses `{type:'function', name, description?, parameters}` shape. Live probes on `gpt-5.4` and `gpt-5.6-luna` accepted this shape and rejected the same definition without `type`.
 - Continuation succeeded by replaying completed function-call items plus `function_call_output`, with no `previous_response_id` and no storage.
 - A completed reasoning item with `encrypted_content` was observed nondeterministically under high reasoning. Full replay succeeded. Its universal necessity was not established; the relay preserves and replays it whenever observed.
 - Multiple function-call items were observed completing sequentially by output index, not interleaving.
