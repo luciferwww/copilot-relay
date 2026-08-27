@@ -254,7 +254,6 @@ function mapTools(
     if (names.has(name)) invalid(`Tool name "${name}" is duplicated.`);
     names.add(name);
     const mapped: Record<string, unknown> = {
-      type: 'function',
       name,
       parameters: requireRecord(tool.input_schema, 'tool.input_schema'),
     };

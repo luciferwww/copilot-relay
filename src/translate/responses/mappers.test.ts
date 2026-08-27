@@ -121,6 +121,39 @@ test('request mapper accepts the narrow Claude Code request envelope', () => {
   });
 });
 
+test('request mapper emits Copilot tool definitions without a type field', () => {
+  const mapped = mapMessagesRequest(
+    {
+      model: 'gpt-test',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'search the web' }],
+      tools: [{
+        name: 'WebSearch',
+        description: 'Search the web',
+        input_schema: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+        },
+      }],
+    },
+    createContext(),
+  );
+
+  assert.deepEqual(mapped.body.tools, [{
+    name: 'WebSearch',
+    description: 'Search the web',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  }]);
+  assert.equal('type' in (mapped.body.tools as Record<string, unknown>[])[0], false);
+  assert.equal(mapped.body.tool_choice, 'auto');
+  assert.equal(mapped.body.parallel_tool_calls, true);
+});
+
 test('request mapper maps VS Code system messages in place', () => {
   const mapped = mapMessagesRequest(
     {
