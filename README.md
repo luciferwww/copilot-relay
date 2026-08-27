@@ -4,7 +4,10 @@ Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible**
 
 > Status: v0.2. Claude Code can use Copilot models that expose either native
 > Anthropic Messages or HTTP OpenAI Responses. OpenAI Responses clients can use
-> native `/v1/responses` passthrough. Codex configuration remains a stub.
+> native `/v1/responses` passthrough. Codex CLI is supported through that native
+> Responses path and can be configured automatically.
+
+Protocol translation follows the [protocol compatibility principle](docs/protocol-compatibility-principle.md): map verified equivalents, pass through what the target can carry, warn and omit optional unsupported extensions, and reject only when a trustworthy target exchange cannot be constructed.
 
 ## Prerequisites
 
@@ -56,14 +59,31 @@ subscription. For each exact requested model, the relay reads the live Copilot
 model catalog, prefers native `/v1/messages`, and otherwise uses the implemented
 HTTP `/responses` translation path. It never substitutes a different model.
 
+For Codex CLI, choose a model whose live Copilot catalog entry exposes
+`/responses`:
+
+```powershell
+copilot-relay configure codex                 # writes ~/.codex/config.toml
+copilot-relay configure codex --model gpt-5.6-sol
+```
+
+The command selects the `copilot-relay` provider and merges its native Responses
+settings into the existing TOML file. It preserves unrelated settings and the
+current model unless `--model` is supplied. Replacement is atomic. Configurations
+using triple-quoted or multiline values, dotted `model_providers.copilot-relay`
+keys, managed array tables, or duplicate managed values are left unchanged with
+an error because they cannot be edited safely by the conservative merger.
+
 ### Changing the port
 
-The default port is `5000`. If something else is already using it, pass
-`--port` on both `start` and `configure claude`:
+The default port is `5000`. Port arguments must contain only decimal digits and
+be in the range `1..65535`. If something else is already using it, pass `--port`
+to `start` and the client configuration command:
 
 ```powershell
 copilot-relay start --port 5001
 copilot-relay configure claude --port 5001
+copilot-relay configure codex --port 5001
 ```
 
 Or set it once in `~/.copilot-relay/config.json` so every future run picks it
@@ -103,7 +123,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 | `copilot-relay start [--host H] [--port N] [--log-level L] [--allow-remote-access]` | Start proxy in foreground; non-loopback hosts require explicit acknowledgement |
 | `copilot-relay stop` | Send SIGTERM to a foreground server via pid file |
 | `copilot-relay configure claude` | Write `~/.claude/settings.json` to point Claude Code at this proxy |
-| `copilot-relay configure codex` | Unimplemented; exits with code `2` |
+| `copilot-relay configure codex [--port N] [--model MODEL]` | Merge a native Responses provider into `~/.codex/config.toml`; preserve unrelated settings and the existing model unless overridden |
 | `copilot-relay config-show` | Print resolved config |
 
 ## Routes served

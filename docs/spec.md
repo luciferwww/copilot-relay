@@ -2,6 +2,8 @@
 
 > Status: approved 2026-08-24; amended 2026-08-26; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
 
+> Compatibility contract: [Protocol Compatibility](./protocol-compatibility-principle.md) governs unknown and additive protocol data throughout this specification.
+
 ## 1. Scope and invariants
 
 v0.2 preserves the v0.1 CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, and loopback-only server. It adds inbound Anthropic Messages to Copilot HTTP `/responses` translation and native OpenAI Responses passthrough.
@@ -15,7 +17,7 @@ The following invariants are mandatory:
 - Translated Responses requests always set `store: false` and never send `previous_response_id`; native Responses requests preserve those client fields.
 - No retry or re-plan occurs after the first downstream response byte.
 - Raw upstream bodies, headers, errors, credentials, image data, and credential-derived substrings never reach logs, CLI output, persisted diagnostics, or client errors.
-- Request fields, content variants, upstream items, and SSE events not admitted by this specification fail closed.
+- Additive fields, variants, output items, and auxiliary events are mapped, passed through, or omitted with a safe warning whenever continuation remains possible. Required identity, association, framing, resource, and translated-state invariants fail closed.
 
 ## 2. Fixed limits and deadlines
 
@@ -37,8 +39,7 @@ These are code constants, not v0.2 configuration fields.
 | `MODEL_CATALOG_TIMEOUT_MS` | 15 seconds | One internal catalog refresh |
 | `EXTERNAL_MODELS_TIMEOUT_MS` | 30 seconds | Client-facing `/v1/models` passthrough |
 | `MODEL_INVOCATION_TIMEOUT_MS` | 10 minutes | One generation request including retries |
-| `CONTINUATION_TTL_MS` | 24 hours | Continuation group idle lifetime, renewed by successful lookup |
-| `CONTINUATION_ABSOLUTE_TTL_MS` | 7 days | Maximum continuation group lifetime regardless of activity |
+| `CONTINUATION_TTL_MS` | 7 days | Continuation group idle lifetime, renewed by successful lookup; there is no absolute lifetime |
 | `CONTINUATION_MAX_GROUPS` | 256 | Published groups per process |
 | `CONTINUATION_GROUP_MAX_BYTES` | 2 MiB | Serialized items in one group |
 | `CONTINUATION_TOTAL_MAX_BYTES` | 32 MiB | Serialized items across all groups |
@@ -54,8 +55,9 @@ MiB means $1024^2$ bytes. Byte limits are enforced while reading or accumulating
 | `~/.copilot-relay/config.json` | User configuration |
 | `~/.copilot-relay/auth.json` | Authentication state |
 | `~/.copilot-relay/server.pid` | Foreground server PID |
+| `~/.copilot-relay/continuations/` | Versioned plaintext continuation group records |
 
-On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`; Windows relies on the user-profile ACL.
+On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`; the continuation directory uses mode `0700`, and its record and temporary files use mode `0600`. Windows relies on the user-profile ACL.
 
 ### 3.2 Config schema
 
@@ -97,13 +99,15 @@ The old free-form `lastRefreshError` field is not written by v0.2. Loading an ex
 
 ### 3.4 Typed diagnostics
 
-Logger and client-error functions accept a local diagnostic code plus allowlisted scalar metadata only: phase, HTTP status, method, normalized path, model id, route, endpoint, request id, duration, cache age, generation, invocation count, retry/re-plan booleans, and allowlisted machine code. Debug request-shape metadata is limited to message-role/content-kind/block-count summaries plus stream/tools counts. They do not accept arbitrary objects, headers, bodies, content values, tool values, or `Error` instances. An exceptional fallback replaces complete known current and superseded credentials, but ordinary paths never format secret-derived input.
+Logger and client-error functions accept a local diagnostic code plus allowlisted scalar metadata only: phase, HTTP status, method, normalized path, model id, route, endpoint, request id, duration, cache age, generation, invocation count, retry/re-plan booleans, and allowlisted machine code. Compatibility diagnostics contain only sorted field names or a fixed context enum; they never include field values, discriminator values, or opaque payloads. Debug request-shape metadata is limited to message-role/content-kind/block-count summaries plus stream/tools counts. They do not accept arbitrary objects, headers, bodies, content values, tool values, or `Error` instances. An exceptional fallback replaces complete known current and superseded credentials, but ordinary paths never format secret-derived input.
 
-Every admitted HTTP request receives a monotonically increasing process-local request id. Info level emits a terminal `request.completed`, `request.failed`, or `request.canceled` event with the allowlisted lifecycle fields; startup remains an info event. Debug level additionally emits `request.received` after bounded JSON parsing and `request.planned` after route selection. No log event contains prompt/system text, tool input/result values, image data, request or response bodies, raw headers, upstream bodies, raw errors, or credential-derived strings.
+A value treated as a preconstructed safe HTTP failure at the request boundary must have an integer status from `400` through `599`, one of the defined failure types, a non-empty message, and an optional string code. Any failure-shaped thrown value outside that closed runtime contract is replaced by the local generic 502 response rather than being reflected to the client.
+
+Every admitted HTTP request receives a monotonically increasing process-local request id. Info level emits a terminal `request.completed`, `request.failed`, or `request.canceled` event with the allowlisted lifecycle fields; startup remains an info event. Warn level emits `translation.fields_ignored`, `translation.component_ignored`, or `translation.passthrough` for observable compatibility degradation. Debug level additionally emits `request.received` after bounded JSON parsing and `request.planned` after route selection. No log event contains prompt/system text, tool input/result values, image data, request or response bodies, raw headers, upstream bodies, raw errors, or credential-derived strings.
 
 ## 4. CLI and HTTP routes
 
-CLI exit code `0` means success, `1` means failure, and `2` means unimplemented. All output uses stdout.
+CLI exit code `0` means success and `1` means failure. All output uses stdout.
 
 | Command | Exact retained behavior |
 |---|---|
@@ -114,7 +118,9 @@ CLI exit code `0` means success, `1` means failure, and `2` means unimplemented.
 | `stop` | Signal the recorded PID; missing/stale PID is cleaned up and treated as success |
 | `config-show` | Create defaults when absent and print path plus config JSON without interleaved logs |
 | `configure claude [--port N]` | Merge `ANTHROPIC_BASE_URL`; preserve an existing `ANTHROPIC_AUTH_TOKEN`, otherwise write the dummy value; preserve peer settings |
-| `configure codex` | Print the unimplemented notice and exit `2` |
+| `configure codex [--port N] [--model MODEL]` | Select the `copilot-relay` provider and conservatively merge its native Responses settings into `~/.codex/config.toml`; preserve unrelated settings and the existing model unless explicitly overridden; atomically replace the file only after a complete temporary write |
+
+Every CLI `--port` value must consist entirely of decimal digits and represent an integer from `1` through `65535`; signs, whitespace, fractions, suffixes, zero, and larger values fail argument parsing. The Codex merger supports ordinary root assignments and regular provider tables while preserving unrelated lines. It fails without changing the target when it encounters triple-quoted or multiline values, dotted keys in the managed `model_providers.copilot-relay` namespace, a managed array-of-table, or duplicate managed definitions. It does not claim to parse or repair arbitrary TOML.
 
 The HTTP server exposes:
 
@@ -225,13 +231,13 @@ Feature support is the intersection of explicit metadata and this spec. Tools re
 
 ### 6.4 Native Responses route
 
-Exact inbound `POST /v1/responses` requires a non-empty string `model` and invokes upstream `/responses` directly. It does not read or mutate `ModelCatalog`; upstream determines whether the model exists and accepts that endpoint. Upstream 400 responses are terminal and are not capability-replanned.
+Exact inbound `POST /v1/responses` requires a string `model` containing at least one non-whitespace character and invokes upstream `/responses` directly without trimming or otherwise changing that value. It does not read or mutate `ModelCatalog`; upstream determines whether the model exists and accepts that endpoint. Upstream 400 responses are terminal and are not capability-replanned.
 
-The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
+The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. A present non-boolean `stream` remains byte-preserved and upstream-owned rather than causing local schema rejection. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
 
-## 7. Closed Messages request mapping
+## 7. Tolerant Messages request mapping
 
-Fields or variants absent from these tables are Anthropic `400 invalid_request_error` before transport.
+The tables define verified mappings, not a closed input schema. Additive fields are omitted with a warning, target-shaped unknown tools may pass through, and unknown optional components are skipped. Return Anthropic `400 invalid_request_error` only when required target data is missing/invalid or continuation cannot remain coherent.
 
 ### 7.1 Top-level fields
 
@@ -244,14 +250,14 @@ Fields or variants absent from these tables are Anthropic `400 invalid_request_e
 | `stream` | Boolean; copied; default `false` |
 | `tools` | Absent or empty array means no tools; non-empty array maps by §7.3 and requires tool capability |
 | `tool_choice` | Map by §7.3 |
-| `temperature` | Absent or exactly `1`; explicit `1` maps to `temperature:1` |
-| `top_p` | Absent or exactly `0.98`; explicit `0.98` maps to `top_p:0.98` |
-| `top_k` | Rejected when present |
-| `stop_sequences` | Absent or empty array; omitted upstream; non-empty rejected |
-| `metadata` | Absent or exactly `{user_id:string}`; copy that object to Responses `metadata` |
-| `output_config` | Absent or exactly `{effort:string}`; require the exact value in live `capabilities.supports.reasoning_effort`; map to Responses `reasoning:{effort}` |
+| `temperature` | Copy to Responses; upstream validates its value |
+| `top_p` | Copy to Responses; upstream validates its value |
+| `top_k` | Omit with warning because Responses has no equivalent |
+| `stop_sequences` | Omit with warning because Responses has no equivalent |
+| `metadata` | Copy `user_id:string`, omit additive keys, and omit the optional object if `user_id` cannot be mapped |
+| `output_config` | Map an advertised non-empty `effort:string`; otherwise omit this optional control with warning |
 
-Every Responses request also sets `store:false`. `previous_response_id` is never sent. Non-default sampling values are rejected because the selected live Copilot Responses contract rejected them during FR9. An absent `output_config` emits no `reasoning` field. A present `output_config` must contain exactly `effort`; `format`, extra keys, non-string values, and empty strings are rejected. If `reasoning_effort` is missing, not an array of strings, or otherwise malformed in live model metadata, return 502; if it is valid but omits the requested effort, return 400. Request-level reasoning effort does not permit Anthropic `thinking` or `redacted_thinking` content blocks.
+Every Responses request also sets `store:false`. `previous_response_id` is never sent. An absent or untranslatable `output_config` emits no `reasoning` field. Additive keys, malformed effort values, unavailable effort metadata, and unadvertised efforts warn and omit this optional control.
 
 ### 7.2 Message content
 
@@ -264,7 +270,7 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 | User `tool_result` with string/text content | `function_call_output` using stored `call_id`; boolean `is_error` and the same exact ephemeral cache hint are validated and omitted upstream; output is concatenated text |
 | User base64 `image` block | `input_image` with data URL, §7.4 |
 
-System-role content must be either a non-empty string or a non-empty block array containing only text blocks. Empty strings, empty arrays, and every non-text block are rejected. Top-level `system` continues to map to Responses `instructions`, while a system-role message remains in its original input position. `tool_result.is_error` may be absent, `false`, or `true`; when present it must be boolean and is omitted upstream because Responses has no equivalent error flag, while the result text is preserved. The only accepted `cache_control` value is exactly `{type:'ephemeral'}` on a `text`, `tool_use`, or `tool_result` block; it is a documented lossy cache hint with no verified Responses equivalent. Extra cache-control keys, other types, and cache hints on other block variants are rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
+Top-level `system` maps to Responses `instructions`, while a system-role message remains in its original input position. Unknown non-text content is skipped with warning. `tool_result.is_error` is omitted because Responses has no equivalent while result text is preserved. Cache-control hints and extensions are omitted with warning. PDF/document, thinking/redacted-thinking, image tool results, URL images, and other unknown blocks are skipped when other translatable content remains; a request with no translatable content fails because no target input can be constructed.
 
 The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
 
@@ -272,7 +278,7 @@ For each represented group, every tool id must resolve to that unexpired group, 
 
 ### 7.3 Tools and tool choice
 
-An absent or empty Anthropic tools array produces no Responses tool fields; `tool_choice` remains invalid without a non-empty tools array. Each entry of a non-empty array `{name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
+An absent or empty Anthropic tools array produces no Responses tool fields. Each custom entry `{type?:'custom', name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`; a malformed custom entry is omitted while additive fields are omitted with warning. Every string discriminator beginning `web_search_` belongs to one version-tolerant tool family and maps to Responses `{type:'web_search'}`. A valid non-empty string-array `allowed_domains` maps to `filters.allowed_domains`; an untranslatable value is omitted with warning. The Anthropic hosted-tool name is used only to resolve `tool_choice` and is not required to equal `web_search`. Other tool types pass through unchanged with a fixed-context warning so Copilot can make the final support decision.
 
 | Anthropic `tool_choice.type` | Responses `tool_choice` |
 |---|---|
@@ -281,7 +287,7 @@ An absent or empty Anthropic tools array produces no Responses tool fields; `too
 | `tool` with an existing `name` | `{type:'function', name}` |
 | `none` | `none` |
 
-`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false`; `false` or absent maps to `true` only when live metadata declares parallel support, otherwise `false`. Tool choice without tools, unknown tool names, or parallel semantics unavailable to the model are rejected.
+`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false`; `false`, invalid, or absent maps according to live parallel support, with invalid values warned and ignored. Unknown tool-choice variants pass through. A named choice that cannot be resolved unambiguously falls back to `auto` with warning.
 
 ### 7.4 Base64 image
 
@@ -311,14 +317,13 @@ interface ContinuationGroup {
   createdAt: number;
   lastAccessedAt: number;
   expiresAt: number;
-  absoluteExpiresAt: number;
   items: readonly CompletedContinuationItem[];
   calls: ReadonlyMap<string, { callId: string; outputIndex: number }>;
   byteSize: number;
 }
 ```
 
-Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity, capped by `absoluteExpiresAt`. Active conversations therefore survive ordinary pauses but cannot renew a group beyond `CONTINUATION_ABSOLUTE_TTL_MS`.
+Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity. Invalid, incomplete, model-mismatched, or otherwise failed lookups do not renew it. There is no absolute lifetime: a group remains available while successfully used within each seven-day window, subject to capacity-driven LRU eviction.
 
 ### 8.2 Staging and atomic publication
 
@@ -330,28 +335,32 @@ Each invocation owns an unpublished stage. A completed function-call item alloca
 2. Against that live view, reject duplicate ids or malformed/empty staged calls.
 3. Compute the new group byte size from UTF-8 JSON serialization. If it exceeds `CONTINUATION_GROUP_MAX_BYTES`, throw without mutation.
 4. In the temporary eviction plan, order live existing groups by `lastAccessedAt`, then `createdAt`, then `groupId`, and select the least recently used groups until adding the new group would satisfy both `CONTINUATION_MAX_GROUPS` and `CONTINUATION_TOTAL_MAX_BYTES`.
-5. In one critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state. Any failure before this step leaves the registry unchanged.
+5. Atomically install the new group's versioned record. A write failure leaves the in-memory registry unchanged and returns a translation 502 before success is committed to the client.
+6. In one synchronous critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state.
+7. Remove expired and evicted records. A failed cleanup is reported without identifiers or content; startup validation and LRU enforcement keep any leftover record unavailable when the store is reopened.
 
 For non-streaming output, publish occurs after complete validation and immediately before writing the Anthropic response. For streaming, it occurs after all tool blocks have been written and immediately before terminal `message_delta`. Failure or disconnect before publication discards the stage; disconnect after publication does not roll it back.
 
-Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, or id collision causes publication failure. Restart loses all groups and unresolved results return 400. Because the client-visible tool id does not contain the opaque upstream call state, a Claude Code conversation with unresolved or retained tool history must be restarted after the relay process restarts.
+Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, id collision, or required persistence failure causes publication failure. Unavailable ids return 400. Atomically published, unexpired groups are recovered after relay process replacement because the client-visible tool id alone does not contain the opaque upstream call state required for replay.
 
-### 8.3 Known restart limitation and future persistence contract
+The count and byte limits are fixed for this persistence phase and have no user-facing configuration. Each publication or startup-recovery plan that performs capacity-driven LRU eviction emits one warning, not one warning per removed group. The warning reports whether group count, aggregate bytes, or both triggered eviction, plus evicted-group count, aggregate group and byte totals before and after eviction, and the oldest evicted idle age. It must not contain group ids, tool ids, record names, model names, tool input, replay items, or other continuation content. Idle-TTL cleanup is expected lifecycle behavior and does not emit this warning.
 
-The current v0.2 registry is intentionally process-local. Its restart failure is observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from the normalized Anthropic history. Unknown ids therefore remain a 400 rather than triggering heuristic reconstruction.
+### 8.3 Persistent continuation contract
 
-A future persistence implementation must preserve finite statelessness across relay process replacement without changing the wire mapping. It must satisfy all of the following before replacing the current process-local contract:
+The released v0.2 registry was process-local. Its restart failure was observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from normalized Anthropic history. The persistent store preserves that authoritative group across process replacement; unknown, expired, or invalid ids remain a 400 rather than triggering heuristic reconstruction.
+
+The implementation preserves finite statelessness across relay process replacement without changing the wire mapping. It:
 
 - persist only atomically published groups and atomically remove expired or evicted groups;
-- use a versioned, authenticated, encrypted-at-rest format whose key is not embedded in the continuation data;
-- retain the existing per-group, total-byte, group-count, model-match, and renewable idle-TTL bounds;
-- validate schema, version, authentication, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
-- fail closed and delete or quarantine corrupted, incompatible, undecryptable, expired, or oversized records without logging their contents;
+- use one closed, versioned plaintext JSON record per group, named `<groupId>.json`, where `groupId` is the existing random UUID;
+- protect the continuation directory and files with the OS user boundary: Unix modes `0700` and `0600`, and the user-profile ACL on Windows;
+- retain the existing per-group, total-byte, group-count, and model-match bounds, with a renewable 7-day idle TTL and no absolute lifetime;
+- emit safe aggregate warnings for capacity-driven LRU eviction without logging continuation ids or content;
+- validate filename/payload agreement, schema, version, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
+- fail closed and delete or quarantine malformed, incompatible, expired, or oversized records without logging their names or contents;
 - never persist client message history beyond the authoritative Responses items and call metadata required for replay;
-- define atomic replacement, crash recovery, file locking, logout cleanup, and concurrent-process ownership before implementation;
-- prove with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
-
-Until that contract is implemented, restart resilience is not an acceptance property of v0.2 and clients must begin a new conversation after relay restart when retained tool history is present.
+- uses flushed temporary files and same-directory atomic rename for record replacement, startup recovery before listening, and an exclusive owner record that blocks a second live relay process; authentication commands do not mutate continuation records;
+- proves with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
 
 ## 9. Non-streaming Responses mapping
 
@@ -360,13 +369,14 @@ The bounded JSON must have matching `model`, a string response `id`, an output a
 - `status:'completed'`; or
 - `status:'incomplete'` with `incomplete_details.reason:'max_output_tokens'` and no function-call output item.
 
-Accepted output items are:
+Translated output items are:
 
 - `message` with assistant `content` containing only `output_text`; each becomes an Anthropic `text` block;
 - `function_call` with string `call_id`, `name`, and JSON-object `arguments`; each becomes `tool_use` with the staged external id;
-- `reasoning`, retained only for continuation and never emitted as Anthropic thinking.
+- `reasoning`, retained only for continuation and never emitted as Anthropic thinking;
+- any other completed item, kept opaque only when a function continuation requires exact replay and otherwise client-invisible with warning.
 
-Unknown types, mismatched model, malformed arguments, non-object arguments, failed/canceled status, missing usage, incomplete for another reason, or any incomplete response containing a function call are upstream protocol failures (502). An incomplete response never publishes continuation state or returns a successful Anthropic `tool_use` response.
+Unknown types and message content variants warn and are ignored. Unknown incomplete reasons degrade to Anthropic `max_tokens`. Mismatched model, malformed function arguments, non-object function arguments, failed/canceled status, missing usage, or any incomplete response containing a function call remain upstream protocol failures (502). An incomplete response never publishes continuation state or returns a successful Anthropic `tool_use` response.
 
 The Anthropic Message is:
 
@@ -409,13 +419,14 @@ Copilot FR9 streams contained no `[DONE]`. `[DONE]` before a valid terminal even
 | `response.output_item.added` (`function_call`) | Open provisional call, allocate tool id, emit `tool_use` `content_block_start` with empty input |
 | `response.function_call_arguments.delta` | Emit `input_json_delta`; append bounded argument state |
 | `response.function_call_arguments.done` | Validate reconstructed argument string; emit nothing |
-| `response.output_item.done` | Validate complete item; stage only completed function-call or reasoning items; for function call emit `content_block_stop` |
+| `response.output_item.done` | Validate item closure; stage completed function-call, reasoning, or opaque items; for function call emit `content_block_stop` |
 | `response.output_item.added/done` (`reasoning`) | Emit nothing; only a completed item is staged, including `encrypted_content` when present |
 | `response.completed` | Require every item done and terminal usage; atomically publish any staged tool group; emit terminal success by §10.3 |
 | `response.incomplete` | Require every item done, reason `max_output_tokens`, usage, and no observed function call; discard any non-call stage and emit terminal success with `max_tokens`. If any function call was added or completed, emit a 502 stream error and no success terminator |
 | `response.failed`, `error` | Emit one Anthropic error and close without success terminator |
+| unknown auxiliary event | Emit a fixed-context warning and continue; enclosing item closure remains authoritative |
 
-Duplicate events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, unknown item/event types, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
+Duplicate translated-state events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Unknown item types, unknown content parts, auxiliary events, and SSE transport fields warn and remain invisible when `output_item.done` can still close the enclosing item. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
 
 ### 10.3 Anthropic event bytes and usage
 
@@ -482,6 +493,7 @@ Observed live on 2026-08-24 with the selected subscription. This record is evide
 - Explicit default sampling `temperature:1` and `top_p:0.98` succeeded; tested non-default values were rejected.
 - `max_output_tokens:15` was rejected; `16` was accepted and could return incomplete with reason `max_output_tokens`.
 - Function choice, `none`, parallel calls, argument deltas, and stateless tool continuation succeeded.
+- Copilot tool definitions used the flat Responses `{type:'function', name, description?, parameters}` shape. Live probes on `gpt-5.4` and `gpt-5.6-luna` accepted this shape and rejected the same definition without `type`.
 - Continuation succeeded by replaying completed function-call items plus `function_call_output`, with no `previous_response_id` and no storage.
 - A completed reasoning item with `encrypted_content` was observed nondeterministically under high reasoning. Full replay succeeded. Its universal necessity was not established; the relay preserves and replays it whenever observed.
 - Multiple function-call items were observed completing sequentially by output index, not interleaving.

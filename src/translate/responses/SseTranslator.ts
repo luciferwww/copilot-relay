@@ -2,8 +2,10 @@ import type {
   ContinuationStage,
   MappingContext,
   ResponsesFunctionCallItem,
+  ResponsesOpaqueItem,
   ResponsesReasoningItem,
 } from './types.js';
+import { logger } from '../../logger.js';
 import {
   SSE_FRAME_MAX_BYTES,
   STREAM_TEXT_MAX_BYTES,
@@ -16,14 +18,18 @@ export type SseWriter = (frame: string) => Promise<void>;
 interface ActiveItem {
   itemId: string;
   outputIndex: number;
-  type: 'message' | 'function_call' | 'reasoning';
+  type: 'message' | 'function_call' | 'reasoning' | 'opaque';
+  sourceType: string;
   blockIndex?: number;
   toolId?: string;
   name?: string;
   callId?: string;
   text: string;
+  partText: string;
   arguments: string;
   partOpen: boolean;
+  ignoredPartOpen: boolean;
+  sawTextPart: boolean;
   textDone: boolean;
   argumentsDone: boolean;
 }
@@ -110,7 +116,7 @@ export class SseTranslator {
       if (field === 'data') data.push(value);
       else if (field === 'event') eventName = value;
       else if (field === 'id' || field === 'retry') continue;
-      else protocol(`Unsupported SSE transport field "${field}".`);
+      else logger.translationFieldsIgnored({ context: 'sse-transport', fields: [field] });
     }
     if (data.length === 0) return;
     const dataText = data.join('\n');
@@ -174,7 +180,7 @@ export class SseTranslator {
       case 'error':
         protocol('Responses stream reported an upstream failure.', 'responses_stream_upstream_failure');
       default:
-        protocol(`Unsupported Responses event type "${type}".`, 'responses_stream_unsupported_event');
+        logger.translationComponentIgnored({ context: 'responses-event' });
     }
   }
 
@@ -206,20 +212,26 @@ export class SseTranslator {
     const itemId = requireNonEmptyString(item.id, 'output item id');
     if (this.itemIds.has(itemId)) protocol('Responses output item id was duplicated.');
     this.itemIds.add(itemId);
-    if (item.type !== 'message' && item.type !== 'function_call' && item.type !== 'reasoning') {
-      protocol(`Unsupported Responses output item type "${String(item.type)}".`);
-    }
+    const sourceType = requireNonEmptyString(item.type, 'output item type');
+    const type = sourceType === 'message' || sourceType === 'function_call' || sourceType === 'reasoning'
+      ? sourceType
+      : 'opaque';
+    if (type === 'opaque') logger.translationComponentIgnored({ context: 'response-output' });
     this.active = {
       itemId,
       outputIndex,
-      type: item.type,
+      type,
+      sourceType,
       text: '',
+      partText: '',
       arguments: '',
       partOpen: false,
+      ignoredPartOpen: false,
+      sawTextPart: false,
       textDone: false,
       argumentsDone: false,
     };
-    if (item.type === 'function_call') {
+    if (type === 'function_call') {
       const name = requireNonEmptyString(item.name, 'function name');
       const callId = requireNonEmptyString(item.call_id, 'function call id');
       const toolId = this.context.registry.allocateToolId(this.stage);
@@ -236,14 +248,24 @@ export class SseTranslator {
 
   private async onContentPartAdded(event: Record<string, unknown>): Promise<void> {
     const active = this.requireActive(event, 'message');
-    if (active.partOpen) protocol('Response message has multiple open content parts.');
+    if (active.partOpen || active.ignoredPartOpen) {
+      protocol('Response message has multiple open content parts.');
+    }
     const part = requireRecord(event.part, 'content part');
-    if (part.type !== 'output_text' || (part.text !== undefined && part.text !== '')) {
-      protocol('Response content part is invalid.');
+    if (part.type !== 'output_text') {
+      active.ignoredPartOpen = true;
+      logger.translationComponentIgnored({ context: 'response-content' });
+      return;
+    }
+    if (part.text !== undefined && part.text !== '') {
+      protocol('Response text content part is invalid.');
     }
     const blockIndex = this.nextBlockIndex++;
     active.blockIndex = blockIndex;
     active.partOpen = true;
+    active.sawTextPart = true;
+    active.partText = '';
+    active.textDone = false;
     await this.emit('content_block_start', {
       type: 'content_block_start',
       index: blockIndex,
@@ -261,6 +283,7 @@ export class SseTranslator {
       protocol('Response text exceeds its size limit.');
     }
     active.text += delta;
+    active.partText += delta;
     await this.emit('content_block_delta', {
       type: 'content_block_delta',
       index: active.blockIndex,
@@ -271,7 +294,7 @@ export class SseTranslator {
   private onTextDone(event: Record<string, unknown>): void {
     const active = this.requireActive(event, 'message');
     if (!active.partOpen || active.textDone) protocol('Response text completion is out of order.');
-    if (requireString(event.text, 'completed text') !== active.text) {
+    if (requireString(event.text, 'completed text') !== active.partText) {
       protocol('Completed response text does not match its deltas.');
     }
     active.textDone = true;
@@ -279,11 +302,15 @@ export class SseTranslator {
 
   private async onContentPartDone(event: Record<string, unknown>): Promise<void> {
     const active = this.requireActive(event, 'message');
+    if (active.ignoredPartOpen) {
+      active.ignoredPartOpen = false;
+      return;
+    }
     if (!active.partOpen || !active.textDone || active.blockIndex === undefined) {
       protocol('Response content part completed out of order.');
     }
     const part = requireRecord(event.part, 'completed content part');
-    if (part.type !== 'output_text' || part.text !== active.text) {
+    if (part.type !== 'output_text' || part.text !== active.partText) {
       protocol('Completed response content part does not match its deltas.');
     }
     active.partOpen = false;
@@ -324,19 +351,30 @@ export class SseTranslator {
     const active = this.requireActive(event);
     const item = requireRecord(event.item, 'completed output item');
     requireNonEmptyString(item.id, 'completed output item id');
-    if (item.type !== active.type) {
+    if (item.type !== active.sourceType) {
       protocol('Completed output item does not match its added item.');
     }
-    if (item.status !== 'completed') protocol('Response output item is not completed.');
+    if (active.type !== 'reasoning' && item.status !== 'completed') {
+      protocol('Response output item is not completed.');
+    }
     if (active.type === 'message') {
-      if (active.partOpen || !active.textDone) protocol('Message item completed before its content.');
+      if (
+        active.partOpen ||
+        active.ignoredPartOpen ||
+        (active.sawTextPart && !active.textDone)
+      ) {
+        protocol('Message item completed before its content.');
+      }
       if (item.role !== 'assistant' || !Array.isArray(item.content)) {
         protocol('Completed message item is invalid.');
       }
       const completedText = item.content
         .map((partValue) => {
           const part = requireRecord(partValue, 'completed message content');
-          if (part.type !== 'output_text') protocol('Completed message content is invalid.');
+          if (part.type !== 'output_text') {
+            logger.translationComponentIgnored({ context: 'response-content' });
+            return '';
+          }
           return requireString(part.text, 'completed message text');
         })
         .join('');
@@ -364,13 +402,18 @@ export class SseTranslator {
         type: 'content_block_stop',
         index: active.blockIndex,
       });
-    } else {
+    } else if (active.type === 'reasoning') {
       if (item.status !== undefined && item.status !== 'completed') {
         protocol('Reasoning item is incomplete.');
       }
       this.context.registry.addItem(this.stage, {
         outputIndex: active.outputIndex,
         item: item as unknown as ResponsesReasoningItem,
+      });
+    } else {
+      this.context.registry.addItem(this.stage, {
+        outputIndex: active.outputIndex,
+        item: item as unknown as ResponsesOpaqueItem,
       });
     }
     this.active = undefined;

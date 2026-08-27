@@ -3,8 +3,10 @@ import type {
   MappedMessage,
   MappingContext,
   ResponsesFunctionCallItem,
+  ResponsesOpaqueItem,
   ResponsesReasoningItem,
 } from './types.js';
+import { logger } from '../../logger.js';
 import { TranslationError } from './types.js';
 
 /** Maps one bounded, complete Responses JSON payload into an Anthropic Message. */
@@ -20,7 +22,9 @@ export function mapResponsesResult(input: unknown, context: MappingContext): Map
   if (response.status !== 'completed' && !incomplete) protocol('Response status is not supported.');
   if (incomplete) {
     const details = requireRecord(response.incomplete_details, 'incomplete_details');
-    if (details.reason !== 'max_output_tokens') protocol('Incomplete response reason is invalid.');
+    if (details.reason !== 'max_output_tokens') {
+      logger.translationFieldsIgnored({ context: 'response-output', fields: ['reason'] });
+    }
   }
 
   const content: Record<string, unknown>[] = [];
@@ -43,7 +47,18 @@ export function mapResponsesResult(input: unknown, context: MappingContext): Map
         context.registry.addItem(stage, { outputIndex, item: reasoning });
         return;
       }
-      protocol(`Unsupported response output type "${String(item.type)}".`);
+      logger.translationComponentIgnored({ context: 'response-output' });
+      if (
+        !incomplete &&
+        typeof item.type === 'string' &&
+        item.type.length > 0 &&
+        (item.status === undefined || item.status === 'completed')
+      ) {
+        context.registry.addItem(stage, {
+          outputIndex,
+          item: item as unknown as ResponsesOpaqueItem,
+        });
+      }
     });
     if (incomplete && hasFunctionCall) {
       protocol('Incomplete response contained a function call.');
@@ -77,7 +92,8 @@ function mapMessageItem(item: Record<string, unknown>, output: Record<string, un
   for (const partValue of item.content) {
     const part = requireRecord(partValue, 'message content');
     if (part.type !== 'output_text' || typeof part.text !== 'string') {
-      protocol('Response message content is invalid.');
+      logger.translationComponentIgnored({ context: 'response-content' });
+      continue;
     }
     output.push({ type: 'text', text: part.text });
   }
