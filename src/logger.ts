@@ -84,6 +84,45 @@ export interface ContinuationCapacityEvictionLog {
   readonly oldestEvictedIdleAgeMs: number;
 }
 
+export interface TranslationFieldsIgnoredLog {
+  readonly context:
+    | 'request'
+    | 'message'
+    | 'text-block'
+    | 'tool-use'
+    | 'tool-result'
+    | 'tool-result-text'
+    | 'system-block'
+    | 'custom-tool'
+    | 'web-search-tool'
+    | 'tool-choice'
+    | 'metadata'
+    | 'output-config'
+    | 'cache-control'
+    | 'image'
+    | 'image-source'
+    | 'response-output'
+    | 'response-content'
+    | 'responses-event'
+    | 'sse-transport';
+  readonly fields: readonly string[];
+}
+
+export interface TranslationComponentIgnoredLog {
+  readonly context:
+    | 'content-block'
+    | 'message'
+    | 'tool'
+    | 'tool-choice'
+    | 'response-output'
+    | 'response-content'
+    | 'responses-event';
+}
+
+export interface TranslationPassthroughLog {
+  readonly context: 'tool' | 'tool-choice';
+}
+
 const order: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 
 let current: LogLevel = 'info';
@@ -120,6 +159,12 @@ export const logger = {
     event: 'request.completed' | 'request.failed' | 'request.canceled',
     fields: RequestTerminalLog,
   ) => logEvent('info', event, fields),
+  translationFieldsIgnored: (fields: TranslationFieldsIgnoredLog) =>
+    logEvent('warn', 'translation.fields_ignored', fields),
+  translationComponentIgnored: (fields: TranslationComponentIgnoredLog) =>
+    logEvent('warn', 'translation.component_ignored', fields),
+  translationPassthrough: (fields: TranslationPassthroughLog) =>
+    logEvent('warn', 'translation.passthrough', fields),
   continuationCapacityEvicted: (fields: ContinuationCapacityEvictionLog) =>
     logEvent('warn', 'continuation.capacity_evicted', fields),
 };

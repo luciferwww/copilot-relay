@@ -314,3 +314,17 @@ describe('UserRepository', () => {
 | Logging | Centralize logging behind a single module; keep call sites decoupled from the library choice | Guidance |
 | Platform | Detect via `process.platform`; avoid hard-coded path separators | Rule |
 | In-memory state | Prefer `Map` over plain objects for keyed collections (e.g., `Map<string, CacheEntry>`) | Default |
+
+---
+
+## 13. Protocol Compatibility *(Rule)*
+
+The repository-wide rationale and decision matrix are defined by [Protocol Compatibility](./protocol-compatibility-principle.md). Protocol adapters are not released in lockstep with either peer, so boundary handling must be tolerant by default:
+
+- Map fields and variants with a verified equivalent.
+- Pass through unknown structures when the target protocol can carry them without reinterpretation.
+- When passthrough is impossible, omit optional unknown fields or components, emit a structured warning containing names or fixed contexts only, and continue.
+- Never log unknown values, request content, response content, or opaque payloads while reporting compatibility degradation.
+- Reject only when required target data is absent or invalid, identity/order/continuation state is inconsistent, input is malformed, a resource bound is exceeded, or continuing would require inventing data or associations.
+
+Tests for a protocol boundary must include additive unknown fields, future versioned discriminators, unknown auxiliary events/items, and the strict invariants that still prevent continuation.

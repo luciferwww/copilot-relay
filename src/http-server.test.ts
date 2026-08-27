@@ -300,6 +300,77 @@ test('native Responses passthrough preserves SSE bytes', async () => {
   }
 });
 
+test('native Responses passes malformed stream values upstream unchanged', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const requestText = '{ "model": "gpt-test", "input": "hello", "stream": "true" }';
+  let upstreamPlan: InvocationPlan | undefined;
+  const runtime = runtimeFor(model, async (plan) => {
+    upstreamPlan = plan;
+    return Response.json({ error: { code: 'invalid_request_body' } }, { status: 400 });
+  });
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: requestText,
+    });
+    assert.equal(response.status, 400);
+    assert.equal(Buffer.from(upstreamPlan?.body ?? []).toString('utf8'), requestText);
+    assert.equal(upstreamPlan?.accept, 'application/json');
+  } finally {
+    await server.close();
+  }
+});
+
+test('HTTP routes reject whitespace-only model ids without changing non-empty values', async () => {
+  const model: ModelRecord = { id: 'unused', supported_endpoints: ['/responses'] };
+  let invocations = 0;
+  const runtime = runtimeFor(model, async () => {
+    invocations += 1;
+    return new Response('{}');
+  });
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    for (const route of ['/v1/responses', '/v1/messages']) {
+      const response = await fetch(`http://127.0.0.1:${server.port}${route}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: '   ' }),
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(invocations, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('HTTP boundary rejects unsafe failure-shaped thrown values', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const runtime = runtimeFor(model, async () => {
+    throw { status: 200, type: 'untrusted_type', message: '' };
+  });
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-test' }),
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: {
+        type: 'api_error',
+        message: 'The relay could not complete the request.',
+        code: null,
+      },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
 test('native Responses invokes upstream without accessing the model catalog', async () => {
   const model: ModelRecord = { id: 'unused', supported_endpoints: [] };
   let invocations = 0;

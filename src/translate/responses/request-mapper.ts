@@ -1,4 +1,5 @@
 import type { ModelRecord } from '../../models/ModelCatalog.js';
+import { logger } from '../../logger.js';
 import type { ContinuationGroup, MappedRequest, MappingContext } from './types.js';
 import { TranslationError } from './types.js';
 
@@ -26,8 +27,10 @@ interface OpenContinuation {
 /** Validates and maps one complete Anthropic Messages request. */
 export function mapMessagesRequest(input: unknown, context: MappingContext): MappedRequest {
   const request = requireRecord(input, 'Request body');
-  rejectUnknownFields(request, TOP_LEVEL_FIELDS, 'request');
-  if ('top_k' in request) invalid('top_k is not supported.');
+  warnUnknownFields(request, TOP_LEVEL_FIELDS, 'request');
+  if ('top_k' in request) {
+    logger.translationFieldsIgnored({ context: 'request', fields: ['top_k'] });
+  }
 
   const modelId = requireNonEmptyString(request.model, 'model');
   if (modelId !== context.model.id) upstream('Resolved model metadata does not match the request.');
@@ -39,16 +42,8 @@ export function mapMessagesRequest(input: unknown, context: MappingContext): Map
   const stream = request.stream === undefined ? false : requireBoolean(request.stream, 'stream');
   if (stream) requireModelSupport(context.model, 'streaming');
 
-  if (request.temperature !== undefined && request.temperature !== 1) {
-    invalid('temperature must be exactly 1 when provided.');
-  }
-  if (request.top_p !== undefined && request.top_p !== 0.98) {
-    invalid('top_p must be exactly 0.98 when provided.');
-  }
   if (request.stop_sequences !== undefined) {
-    if (!Array.isArray(request.stop_sequences) || request.stop_sequences.length !== 0) {
-      invalid('stop_sequences must be an empty array when provided.');
-    }
+    logger.translationFieldsIgnored({ context: 'request', fields: ['stop_sequences'] });
   }
 
   const body: Record<string, unknown> = {
@@ -64,8 +59,8 @@ export function mapMessagesRequest(input: unknown, context: MappingContext): Map
   if (metadata !== undefined) body.metadata = metadata;
   const reasoning = mapOutputConfig(request.output_config, context.model);
   if (reasoning !== undefined) body.reasoning = reasoning;
-  if (request.temperature !== undefined) body.temperature = 1;
-  if (request.top_p !== undefined) body.top_p = 0.98;
+  if (request.temperature !== undefined) body.temperature = request.temperature;
+  if (request.top_p !== undefined) body.top_p = request.top_p;
   mapTools(request.tools, request.tool_choice, context.model, body);
   return { body, stream };
 }
@@ -79,18 +74,16 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
 
   for (const messageValue of value) {
     const message = requireRecord(messageValue, 'message');
-    rejectUnknownFields(message, new Set(['role', 'content']), 'message');
+    warnUnknownFields(message, new Set(['role', 'content']), 'message');
     const role = message.role;
     if (role !== 'user' && role !== 'assistant' && role !== 'system') {
-      invalid('Message role must be user, assistant, or system.');
+      logger.translationComponentIgnored({ context: 'message' });
+      continue;
     }
     if (role === 'system' && message.content === '') {
       invalid('System message content must not be empty.');
     }
     const blocks = normalizeContent(message.content);
-    if (role === 'system' && blocks.some((block) => block.type !== 'text')) {
-      invalid('System messages support only text blocks.');
-    }
     const toolUseBlocks = blocks.filter((block) => block.type === 'tool_use');
 
     if (toolUseBlocks.length > 0) {
@@ -107,7 +100,7 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
     let continuationInserted = false;
     for (const block of blocks) {
       if (block.type === 'text') {
-        rejectUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'text block');
+        warnUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'text-block');
         validateCacheControl(block.cache_control);
         const textType = role === 'assistant' ? 'output_text' : 'input_text';
         output.push({
@@ -122,10 +115,16 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
         continue;
       }
       if (block.type === 'image') {
-        if (role !== 'user') invalid('Images are accepted only in user messages.');
-        imageCount += 1;
-        if (imageCount > 1) invalid('At most one image is supported.');
-        output.push({ role: 'user', content: [mapImage(block, context.model)] });
+        if (role !== 'user') {
+          logger.translationComponentIgnored({ context: 'content-block' });
+          continue;
+        }
+        const image = mapImage(block, context.model);
+        if (image) {
+          imageCount += 1;
+          if (imageCount > 1) invalid('At most one image is supported.');
+          output.push({ role: 'user', content: [image] });
+        }
         continue;
       }
       if (block.type === 'tool_use') {
@@ -141,10 +140,10 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
         continue;
       }
       if (block.type === 'tool_result') {
-        rejectUnknownFields(
+        warnUnknownFields(
           block,
           new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
-          'tool_result',
+          'tool-result',
         );
         validateCacheControl(block.cache_control);
         if (role !== 'user' || !open) invalid('Tool result appears before its tool use.');
@@ -166,10 +165,11 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
         }
         continue;
       }
-      invalid(`Unsupported content block type "${String(block.type)}".`);
+      logger.translationComponentIgnored({ context: 'content-block' });
     }
   }
   if (open) invalid('A continuation group is missing tool results.');
+  if (output.length === 0) invalid('messages contain no translatable content.');
   return output;
 }
 
@@ -183,7 +183,7 @@ function validateHistoricalToolUse(
   block: Readonly<Record<string, unknown>>,
   group: ContinuationGroup,
 ): void {
-  rejectUnknownFields(block, new Set(['type', 'id', 'name', 'input', 'cache_control']), 'tool_use');
+  warnUnknownFields(block, new Set(['type', 'id', 'name', 'input', 'cache_control']), 'tool-use');
   validateCacheControl(block.cache_control);
   const id = requireNonEmptyString(block.id, 'tool_use.id');
   const call = group.calls.get(id);
@@ -211,8 +211,11 @@ function mapToolResultContent(value: unknown): string {
   return value
     .map((entry) => {
       const block = requireRecord(entry, 'tool result content');
-      rejectUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'tool result text');
-      if (block.type !== 'text') invalid('Tool result content supports only text blocks.');
+      warnUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'tool-result-text');
+      if (block.type !== 'text') {
+        logger.translationComponentIgnored({ context: 'content-block' });
+        return '';
+      }
       validateCacheControl(block.cache_control);
       return requireString(block.text, 'tool result text');
     })
@@ -221,17 +224,26 @@ function mapToolResultContent(value: unknown): string {
 
 function mapSystem(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value === 'string') return value;
-  if (!Array.isArray(value)) invalid('system must be a string or text-block array.');
-  return value
-    .map((entry) => {
-      const block = requireRecord(entry, 'system block');
-      rejectUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'system block');
-      if (block.type !== 'text') invalid('system supports only text blocks.');
+  if (typeof value === 'string') return value.length > 0 ? value : undefined;
+  if (!Array.isArray(value)) {
+    logger.translationComponentIgnored({ context: 'content-block' });
+    return undefined;
+  }
+  const parts = value.flatMap((entry) => {
+      if (!isRecord(entry)) {
+        logger.translationComponentIgnored({ context: 'content-block' });
+        return [];
+      }
+      const block = entry;
+      warnUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'system-block');
+      if (block.type !== 'text' || typeof block.text !== 'string') {
+        logger.translationComponentIgnored({ context: 'content-block' });
+        return [];
+      }
       validateCacheControl(block.cache_control);
-      return requireString(block.text, 'system text');
-    })
-    .join('\n\n');
+      return [block.text];
+    });
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
 function mapTools(
@@ -241,55 +253,165 @@ function mapTools(
   output: Record<string, unknown>,
 ): void {
   if (toolsValue === undefined || (Array.isArray(toolsValue) && toolsValue.length === 0)) {
-    if (choiceValue !== undefined) invalid('tool_choice requires tools.');
+    if (choiceValue !== undefined) {
+      logger.translationComponentIgnored({ context: 'tool-choice' });
+    }
     return;
   }
-  if (!Array.isArray(toolsValue)) invalid('tools must be an array.');
-  requireModelSupport(model, 'tool_calls');
-  const names = new Set<string>();
-  output.tools = toolsValue.map((entry) => {
-    const tool = requireRecord(entry, 'tool');
-    rejectUnknownFields(tool, new Set(['type', 'name', 'description', 'input_schema']), 'tool');
-    if (tool.type !== undefined && tool.type !== 'custom') {
-      invalid('Only custom tools are supported.');
+  if (!Array.isArray(toolsValue)) {
+    logger.translationComponentIgnored({ context: 'tool' });
+    if (choiceValue !== undefined) logger.translationComponentIgnored({ context: 'tool-choice' });
+    return;
+  }
+  const choices = new Map<string, Record<string, unknown>>();
+  const ambiguousNames = new Set<string>();
+  const mappedTools: Record<string, unknown>[] = [];
+  for (const entry of toolsValue) {
+    if (!isRecord(entry)) {
+      logger.translationComponentIgnored({ context: 'tool' });
+      continue;
     }
-    const name = requireNonEmptyString(tool.name, 'tool.name');
-    if (names.has(name)) invalid(`Tool name "${name}" is duplicated.`);
-    names.add(name);
+    const tool = entry;
+    if (typeof tool.type === 'string' && tool.type.startsWith('web_search_')) {
+      warnUnknownFields(
+        tool,
+        new Set(['type', 'name', 'allowed_domains']),
+        'web-search-tool',
+      );
+      const mapped: Record<string, unknown> = { type: 'web_search' };
+      registerToolChoice(tool.name, { type: 'web_search' }, choices, ambiguousNames);
+      if (tool.allowed_domains !== undefined) {
+        if (
+          Array.isArray(tool.allowed_domains) &&
+          tool.allowed_domains.length > 0 &&
+          tool.allowed_domains.every((domain) => typeof domain === 'string' && domain.length > 0)
+        ) {
+          mapped.filters = { allowed_domains: tool.allowed_domains };
+        } else {
+          logger.translationFieldsIgnored({
+            context: 'web-search-tool',
+            fields: ['allowed_domains'],
+          });
+        }
+      }
+      mappedTools.push(mapped);
+      continue;
+    }
+    if (tool.type !== undefined && tool.type !== 'custom') {
+      logger.translationPassthrough({ context: 'tool' });
+      if (typeof tool.type === 'string') {
+        registerToolChoice(tool.name, { type: tool.type }, choices, ambiguousNames);
+      }
+      mappedTools.push({ ...tool });
+      continue;
+    }
+    warnUnknownFields(
+      tool,
+      new Set(['type', 'name', 'description', 'input_schema']),
+      'custom-tool',
+    );
+    if (
+      typeof tool.name !== 'string' ||
+      tool.name.length === 0 ||
+      !isRecord(tool.input_schema)
+    ) {
+      logger.translationComponentIgnored({ context: 'tool' });
+      continue;
+    }
+    const name = tool.name;
     const mapped: Record<string, unknown> = {
       type: 'function',
       name,
-      parameters: requireRecord(tool.input_schema, 'tool.input_schema'),
+      parameters: tool.input_schema,
     };
+    registerToolChoice(name, { type: 'function', name }, choices, ambiguousNames);
     if (tool.description !== undefined) {
-      mapped.description = requireString(tool.description, 'tool.description');
+      if (typeof tool.description === 'string') mapped.description = tool.description;
+      else logger.translationFieldsIgnored({ context: 'custom-tool', fields: ['description'] });
     }
-    return mapped;
-  });
+    mappedTools.push(mapped);
+  }
+  if (mappedTools.length === 0) {
+    if (choiceValue !== undefined) logger.translationComponentIgnored({ context: 'tool-choice' });
+    return;
+  }
+  output.tools = mappedTools;
 
-  const choice = choiceValue === undefined ? { type: 'auto' } : requireRecord(choiceValue, 'tool_choice');
-  rejectUnknownFields(choice, new Set(['type', 'name', 'disable_parallel_tool_use']), 'tool_choice');
+  const choice = choiceValue === undefined
+    ? { type: 'auto' }
+    : isRecord(choiceValue)
+      ? choiceValue
+      : undefined;
+  if (!choice) {
+    logger.translationComponentIgnored({ context: 'tool-choice' });
+    output.tool_choice = 'auto';
+    output.parallel_tool_calls = model.capabilities?.supports?.parallel_tool_calls === true;
+    return;
+  }
+  warnUnknownFields(
+    choice,
+    new Set(['type', 'name', 'disable_parallel_tool_use']),
+    'tool-choice',
+  );
   if (choice.type === 'auto') output.tool_choice = 'auto';
   else if (choice.type === 'any') output.tool_choice = 'required';
   else if (choice.type === 'none') output.tool_choice = 'none';
   else if (choice.type === 'tool') {
-    const name = requireNonEmptyString(choice.name, 'tool_choice.name');
-    if (!names.has(name)) invalid(`Unknown tool choice "${name}".`);
-    output.tool_choice = { type: 'function', name };
-  } else invalid('Unsupported tool_choice.type.');
+    const selected = typeof choice.name === 'string' && !ambiguousNames.has(choice.name)
+      ? choices.get(choice.name)
+      : undefined;
+    if (selected) output.tool_choice = selected;
+    else {
+      logger.translationFieldsIgnored({ context: 'tool-choice', fields: ['name'] });
+      output.tool_choice = 'auto';
+    }
+  } else {
+    logger.translationPassthrough({ context: 'tool-choice' });
+    output.tool_choice = Object.fromEntries(
+      Object.entries(choice).filter(([key]) => key !== 'disable_parallel_tool_use'),
+    );
+  }
 
   const disableParallel = choice.disable_parallel_tool_use;
   if (disableParallel !== undefined && typeof disableParallel !== 'boolean') {
-    invalid('disable_parallel_tool_use must be boolean.');
+    logger.translationFieldsIgnored({
+      context: 'tool-choice',
+      fields: ['disable_parallel_tool_use'],
+    });
   }
-  output.parallel_tool_calls = disableParallel === true ? false : modelSupport(model, 'parallel_tool_calls');
+  output.parallel_tool_calls = disableParallel === true
+    ? false
+    : model.capabilities?.supports?.parallel_tool_calls === true;
+}
+
+function registerToolChoice(
+  value: unknown,
+  choice: Record<string, unknown>,
+  choices: Map<string, Record<string, unknown>>,
+  ambiguousNames: Set<string>,
+): void {
+  if (typeof value !== 'string' || value.length === 0 || ambiguousNames.has(value)) return;
+  if (choices.has(value)) {
+    choices.delete(value);
+    ambiguousNames.add(value);
+    return;
+  }
+  choices.set(value, choice);
 }
 
 function mapMetadata(value: unknown): Record<string, string> | undefined {
   if (value === undefined) return undefined;
-  const metadata = requireRecord(value, 'metadata');
-  rejectUnknownFields(metadata, new Set(['user_id']), 'metadata');
-  return { user_id: requireString(metadata.user_id, 'metadata.user_id') };
+  if (!isRecord(value)) {
+    logger.translationComponentIgnored({ context: 'content-block' });
+    return undefined;
+  }
+  const metadata = value;
+  warnUnknownFields(metadata, new Set(['user_id']), 'metadata');
+  if (typeof metadata.user_id !== 'string') {
+    logger.translationFieldsIgnored({ context: 'metadata', fields: ['user_id'] });
+    return undefined;
+  }
+  return { user_id: metadata.user_id };
 }
 
 function mapOutputConfig(
@@ -297,37 +419,58 @@ function mapOutputConfig(
   model: ModelRecord,
 ): Record<string, string> | undefined {
   if (value === undefined) return undefined;
-  const outputConfig = requireRecord(value, 'output_config');
-  rejectUnknownFields(outputConfig, new Set(['effort']), 'output_config');
-  const effort = requireNonEmptyString(outputConfig.effort, 'output_config.effort');
+  if (!isRecord(value)) {
+    logger.translationComponentIgnored({ context: 'content-block' });
+    return undefined;
+  }
+  const outputConfig = value;
+  warnUnknownFields(outputConfig, new Set(['effort']), 'output-config');
+  if (typeof outputConfig.effort !== 'string' || outputConfig.effort.length === 0) {
+    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
+    return undefined;
+  }
+  const effort = outputConfig.effort;
   const supportedEfforts = model.capabilities?.supports?.reasoning_effort;
   if (
     !Array.isArray(supportedEfforts) ||
     !supportedEfforts.every((entry) => typeof entry === 'string')
   ) {
-    upstream('Model reasoning-effort metadata is unavailable.');
+    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
+    return undefined;
   }
   if (!supportedEfforts.includes(effort)) {
-    invalid(`Model does not support reasoning effort "${effort}".`);
+    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
+    return undefined;
   }
   return { effort };
 }
 
 function validateCacheControl(value: unknown): void {
   if (value === undefined) return;
-  const cacheControl = requireRecord(value, 'cache_control');
-  rejectUnknownFields(cacheControl, new Set(['type']), 'cache_control');
+  if (!isRecord(value)) {
+    logger.translationFieldsIgnored({ context: 'cache-control', fields: ['cache_control'] });
+    return;
+  }
+  const cacheControl = value;
+  warnUnknownFields(cacheControl, new Set(['type']), 'cache-control');
   if (cacheControl.type !== 'ephemeral') {
-    invalid('cache_control.type must be "ephemeral".');
+    logger.translationFieldsIgnored({ context: 'cache-control', fields: ['type'] });
   }
 }
 
-function mapImage(block: Record<string, unknown>, model: ModelRecord): Record<string, unknown> {
-  rejectUnknownFields(block, new Set(['type', 'source']), 'image');
+function mapImage(block: Record<string, unknown>, model: ModelRecord): Record<string, unknown> | undefined {
+  warnUnknownFields(block, new Set(['type', 'source']), 'image');
+  if (!isRecord(block.source)) {
+    logger.translationComponentIgnored({ context: 'content-block' });
+    return undefined;
+  }
+  const source = block.source;
+  warnUnknownFields(source, new Set(['type', 'media_type', 'data']), 'image-source');
+  if (source.type !== 'base64') {
+    logger.translationComponentIgnored({ context: 'content-block' });
+    return undefined;
+  }
   requireModelSupport(model, 'vision');
-  const source = requireRecord(block.source, 'image.source');
-  rejectUnknownFields(source, new Set(['type', 'media_type', 'data']), 'image.source');
-  if (source.type !== 'base64') invalid('Only base64 image sources are supported.');
   const mediaType = requireNonEmptyString(source.media_type, 'image.source.media_type');
   const data = requireNonEmptyString(source.data, 'image.source.data');
   if (!isCanonicalBase64(data)) invalid('Image data must be canonical base64.');
@@ -395,13 +538,13 @@ function jsonEqual(left: unknown, right: unknown): boolean {
   return false;
 }
 
-function rejectUnknownFields(
+function warnUnknownFields(
   value: Readonly<Record<string, unknown>>,
   allowed: ReadonlySet<string>,
-  label: string,
+  context: Parameters<typeof logger.translationFieldsIgnored>[0]['context'],
 ): void {
-  const unknown = Object.keys(value).find((key) => !allowed.has(key));
-  if (unknown) invalid(`Unknown ${label} field "${unknown}".`);
+  const fields = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+  if (fields.length > 0) logger.translationFieldsIgnored({ context, fields });
 }
 
 function requireRecord(value: unknown, label: string, metadata = false): Record<string, unknown> {

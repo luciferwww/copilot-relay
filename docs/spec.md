@@ -2,6 +2,8 @@
 
 > Status: approved 2026-08-24; amended 2026-08-26; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
 
+> Compatibility contract: [Protocol Compatibility](./protocol-compatibility-principle.md) governs unknown and additive protocol data throughout this specification.
+
 ## 1. Scope and invariants
 
 v0.2 preserves the v0.1 CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, and loopback-only server. It adds inbound Anthropic Messages to Copilot HTTP `/responses` translation and native OpenAI Responses passthrough.
@@ -15,7 +17,7 @@ The following invariants are mandatory:
 - Translated Responses requests always set `store: false` and never send `previous_response_id`; native Responses requests preserve those client fields.
 - No retry or re-plan occurs after the first downstream response byte.
 - Raw upstream bodies, headers, errors, credentials, image data, and credential-derived substrings never reach logs, CLI output, persisted diagnostics, or client errors.
-- Request fields, content variants, upstream items, and SSE events not admitted by this specification fail closed.
+- Additive fields, variants, output items, and auxiliary events are mapped, passed through, or omitted with a safe warning whenever continuation remains possible. Required identity, association, framing, resource, and translated-state invariants fail closed.
 
 ## 2. Fixed limits and deadlines
 
@@ -97,13 +99,15 @@ The old free-form `lastRefreshError` field is not written by v0.2. Loading an ex
 
 ### 3.4 Typed diagnostics
 
-Logger and client-error functions accept a local diagnostic code plus allowlisted scalar metadata only: phase, HTTP status, method, normalized path, model id, route, endpoint, request id, duration, cache age, generation, invocation count, retry/re-plan booleans, and allowlisted machine code. Debug request-shape metadata is limited to message-role/content-kind/block-count summaries plus stream/tools counts. They do not accept arbitrary objects, headers, bodies, content values, tool values, or `Error` instances. An exceptional fallback replaces complete known current and superseded credentials, but ordinary paths never format secret-derived input.
+Logger and client-error functions accept a local diagnostic code plus allowlisted scalar metadata only: phase, HTTP status, method, normalized path, model id, route, endpoint, request id, duration, cache age, generation, invocation count, retry/re-plan booleans, and allowlisted machine code. Compatibility diagnostics contain only sorted field names or a fixed context enum; they never include field values, discriminator values, or opaque payloads. Debug request-shape metadata is limited to message-role/content-kind/block-count summaries plus stream/tools counts. They do not accept arbitrary objects, headers, bodies, content values, tool values, or `Error` instances. An exceptional fallback replaces complete known current and superseded credentials, but ordinary paths never format secret-derived input.
 
-Every admitted HTTP request receives a monotonically increasing process-local request id. Info level emits a terminal `request.completed`, `request.failed`, or `request.canceled` event with the allowlisted lifecycle fields; startup remains an info event. Debug level additionally emits `request.received` after bounded JSON parsing and `request.planned` after route selection. No log event contains prompt/system text, tool input/result values, image data, request or response bodies, raw headers, upstream bodies, raw errors, or credential-derived strings.
+A value treated as a preconstructed safe HTTP failure at the request boundary must have an integer status from `400` through `599`, one of the defined failure types, a non-empty message, and an optional string code. Any failure-shaped thrown value outside that closed runtime contract is replaced by the local generic 502 response rather than being reflected to the client.
+
+Every admitted HTTP request receives a monotonically increasing process-local request id. Info level emits a terminal `request.completed`, `request.failed`, or `request.canceled` event with the allowlisted lifecycle fields; startup remains an info event. Warn level emits `translation.fields_ignored`, `translation.component_ignored`, or `translation.passthrough` for observable compatibility degradation. Debug level additionally emits `request.received` after bounded JSON parsing and `request.planned` after route selection. No log event contains prompt/system text, tool input/result values, image data, request or response bodies, raw headers, upstream bodies, raw errors, or credential-derived strings.
 
 ## 4. CLI and HTTP routes
 
-CLI exit code `0` means success, `1` means failure, and `2` means unimplemented. All output uses stdout.
+CLI exit code `0` means success and `1` means failure. All output uses stdout.
 
 | Command | Exact retained behavior |
 |---|---|
@@ -114,7 +118,9 @@ CLI exit code `0` means success, `1` means failure, and `2` means unimplemented.
 | `stop` | Signal the recorded PID; missing/stale PID is cleaned up and treated as success |
 | `config-show` | Create defaults when absent and print path plus config JSON without interleaved logs |
 | `configure claude [--port N]` | Merge `ANTHROPIC_BASE_URL`; preserve an existing `ANTHROPIC_AUTH_TOKEN`, otherwise write the dummy value; preserve peer settings |
-| `configure codex` | Print the unimplemented notice and exit `2` |
+| `configure codex [--port N] [--model MODEL]` | Select the `copilot-relay` provider and conservatively merge its native Responses settings into `~/.codex/config.toml`; preserve unrelated settings and the existing model unless explicitly overridden; atomically replace the file only after a complete temporary write |
+
+Every CLI `--port` value must consist entirely of decimal digits and represent an integer from `1` through `65535`; signs, whitespace, fractions, suffixes, zero, and larger values fail argument parsing. The Codex merger supports ordinary root assignments and regular provider tables while preserving unrelated lines. It fails without changing the target when it encounters triple-quoted or multiline values, dotted keys in the managed `model_providers.copilot-relay` namespace, a managed array-of-table, or duplicate managed definitions. It does not claim to parse or repair arbitrary TOML.
 
 The HTTP server exposes:
 
@@ -225,13 +231,13 @@ Feature support is the intersection of explicit metadata and this spec. Tools re
 
 ### 6.4 Native Responses route
 
-Exact inbound `POST /v1/responses` requires a non-empty string `model` and invokes upstream `/responses` directly. It does not read or mutate `ModelCatalog`; upstream determines whether the model exists and accepts that endpoint. Upstream 400 responses are terminal and are not capability-replanned.
+Exact inbound `POST /v1/responses` requires a string `model` containing at least one non-whitespace character and invokes upstream `/responses` directly without trimming or otherwise changing that value. It does not read or mutate `ModelCatalog`; upstream determines whether the model exists and accepts that endpoint. Upstream 400 responses are terminal and are not capability-replanned.
 
-The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
+The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. A present non-boolean `stream` remains byte-preserved and upstream-owned rather than causing local schema rejection. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
 
-## 7. Closed Messages request mapping
+## 7. Tolerant Messages request mapping
 
-Fields or variants absent from these tables are Anthropic `400 invalid_request_error` before transport.
+The tables define verified mappings, not a closed input schema. Additive fields are omitted with a warning, target-shaped unknown tools may pass through, and unknown optional components are skipped. Return Anthropic `400 invalid_request_error` only when required target data is missing/invalid or continuation cannot remain coherent.
 
 ### 7.1 Top-level fields
 
@@ -244,14 +250,14 @@ Fields or variants absent from these tables are Anthropic `400 invalid_request_e
 | `stream` | Boolean; copied; default `false` |
 | `tools` | Absent or empty array means no tools; non-empty array maps by §7.3 and requires tool capability |
 | `tool_choice` | Map by §7.3 |
-| `temperature` | Absent or exactly `1`; explicit `1` maps to `temperature:1` |
-| `top_p` | Absent or exactly `0.98`; explicit `0.98` maps to `top_p:0.98` |
-| `top_k` | Rejected when present |
-| `stop_sequences` | Absent or empty array; omitted upstream; non-empty rejected |
-| `metadata` | Absent or exactly `{user_id:string}`; copy that object to Responses `metadata` |
-| `output_config` | Absent or exactly `{effort:string}`; require the exact value in live `capabilities.supports.reasoning_effort`; map to Responses `reasoning:{effort}` |
+| `temperature` | Copy to Responses; upstream validates its value |
+| `top_p` | Copy to Responses; upstream validates its value |
+| `top_k` | Omit with warning because Responses has no equivalent |
+| `stop_sequences` | Omit with warning because Responses has no equivalent |
+| `metadata` | Copy `user_id:string`, omit additive keys, and omit the optional object if `user_id` cannot be mapped |
+| `output_config` | Map an advertised non-empty `effort:string`; otherwise omit this optional control with warning |
 
-Every Responses request also sets `store:false`. `previous_response_id` is never sent. Non-default sampling values are rejected because the selected live Copilot Responses contract rejected them during FR9. An absent `output_config` emits no `reasoning` field. A present `output_config` must contain exactly `effort`; `format`, extra keys, non-string values, and empty strings are rejected. If `reasoning_effort` is missing, not an array of strings, or otherwise malformed in live model metadata, return 502; if it is valid but omits the requested effort, return 400. Request-level reasoning effort does not permit Anthropic `thinking` or `redacted_thinking` content blocks.
+Every Responses request also sets `store:false`. `previous_response_id` is never sent. An absent or untranslatable `output_config` emits no `reasoning` field. Additive keys, malformed effort values, unavailable effort metadata, and unadvertised efforts warn and omit this optional control.
 
 ### 7.2 Message content
 
@@ -264,7 +270,7 @@ Every Responses request also sets `store:false`. `previous_response_id` is never
 | User `tool_result` with string/text content | `function_call_output` using stored `call_id`; boolean `is_error` and the same exact ephemeral cache hint are validated and omitted upstream; output is concatenated text |
 | User base64 `image` block | `input_image` with data URL, §7.4 |
 
-System-role content must be either a non-empty string or a non-empty block array containing only text blocks. Empty strings, empty arrays, and every non-text block are rejected. Top-level `system` continues to map to Responses `instructions`, while a system-role message remains in its original input position. `tool_result.is_error` may be absent, `false`, or `true`; when present it must be boolean and is omitted upstream because Responses has no equivalent error flag, while the result text is preserved. The only accepted `cache_control` value is exactly `{type:'ephemeral'}` on a `text`, `tool_use`, or `tool_result` block; it is a documented lossy cache hint with no verified Responses equivalent. Extra cache-control keys, other types, and cache hints on other block variants are rejected. Tool results, tool uses, and plain text retain message/content order subject to replay grouping. PDF/document, thinking/redacted-thinking, image tool results, URL images, and unknown blocks are rejected.
+Top-level `system` maps to Responses `instructions`, while a system-role message remains in its original input position. Unknown non-text content is skipped with warning. `tool_result.is_error` is omitted because Responses has no equivalent while result text is preserved. Cache-control hints and extensions are omitted with warning. PDF/document, thinking/redacted-thinking, image tool results, URL images, and other unknown blocks are skipped when other translatable content remains; a request with no translatable content fails because no target input can be constructed.
 
 The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
 
@@ -272,7 +278,7 @@ For each represented group, every tool id must resolve to that unexpired group, 
 
 ### 7.3 Tools and tool choice
 
-An absent or empty Anthropic tools array produces no Responses tool fields; `tool_choice` remains invalid without a non-empty tools array. Each custom entry `{type?:'custom', name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`. The explicit Anthropic `type:'custom'` discriminator and its legacy omission are equivalent. Anthropic server-tool types such as `web_search_20250305` are rejected because Copilot cannot execute those Anthropic-hosted tools. Names must be unique non-empty strings. Schemas are preserved as JSON values and bounded by the request limit.
+An absent or empty Anthropic tools array produces no Responses tool fields. Each custom entry `{type?:'custom', name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`; a malformed custom entry is omitted while additive fields are omitted with warning. Every string discriminator beginning `web_search_` belongs to one version-tolerant tool family and maps to Responses `{type:'web_search'}`. A valid non-empty string-array `allowed_domains` maps to `filters.allowed_domains`; an untranslatable value is omitted with warning. The Anthropic hosted-tool name is used only to resolve `tool_choice` and is not required to equal `web_search`. Other tool types pass through unchanged with a fixed-context warning so Copilot can make the final support decision.
 
 | Anthropic `tool_choice.type` | Responses `tool_choice` |
 |---|---|
@@ -281,7 +287,7 @@ An absent or empty Anthropic tools array produces no Responses tool fields; `too
 | `tool` with an existing `name` | `{type:'function', name}` |
 | `none` | `none` |
 
-`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false`; `false` or absent maps to `true` only when live metadata declares parallel support, otherwise `false`. Tool choice without tools, unknown tool names, or parallel semantics unavailable to the model are rejected.
+`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false`; `false`, invalid, or absent maps according to live parallel support, with invalid values warned and ignored. Unknown tool-choice variants pass through. A named choice that cannot be resolved unambiguously falls back to `auto` with warning.
 
 ### 7.4 Base64 image
 
@@ -363,13 +369,14 @@ The bounded JSON must have matching `model`, a string response `id`, an output a
 - `status:'completed'`; or
 - `status:'incomplete'` with `incomplete_details.reason:'max_output_tokens'` and no function-call output item.
 
-Accepted output items are:
+Translated output items are:
 
 - `message` with assistant `content` containing only `output_text`; each becomes an Anthropic `text` block;
 - `function_call` with string `call_id`, `name`, and JSON-object `arguments`; each becomes `tool_use` with the staged external id;
-- `reasoning`, retained only for continuation and never emitted as Anthropic thinking.
+- `reasoning`, retained only for continuation and never emitted as Anthropic thinking;
+- any other completed item, kept opaque only when a function continuation requires exact replay and otherwise client-invisible with warning.
 
-Unknown types, mismatched model, malformed arguments, non-object arguments, failed/canceled status, missing usage, incomplete for another reason, or any incomplete response containing a function call are upstream protocol failures (502). An incomplete response never publishes continuation state or returns a successful Anthropic `tool_use` response.
+Unknown types and message content variants warn and are ignored. Unknown incomplete reasons degrade to Anthropic `max_tokens`. Mismatched model, malformed function arguments, non-object function arguments, failed/canceled status, missing usage, or any incomplete response containing a function call remain upstream protocol failures (502). An incomplete response never publishes continuation state or returns a successful Anthropic `tool_use` response.
 
 The Anthropic Message is:
 
@@ -412,13 +419,14 @@ Copilot FR9 streams contained no `[DONE]`. `[DONE]` before a valid terminal even
 | `response.output_item.added` (`function_call`) | Open provisional call, allocate tool id, emit `tool_use` `content_block_start` with empty input |
 | `response.function_call_arguments.delta` | Emit `input_json_delta`; append bounded argument state |
 | `response.function_call_arguments.done` | Validate reconstructed argument string; emit nothing |
-| `response.output_item.done` | Validate complete item; stage only completed function-call or reasoning items; for function call emit `content_block_stop` |
+| `response.output_item.done` | Validate item closure; stage completed function-call, reasoning, or opaque items; for function call emit `content_block_stop` |
 | `response.output_item.added/done` (`reasoning`) | Emit nothing; only a completed item is staged, including `encrypted_content` when present |
 | `response.completed` | Require every item done and terminal usage; atomically publish any staged tool group; emit terminal success by §10.3 |
 | `response.incomplete` | Require every item done, reason `max_output_tokens`, usage, and no observed function call; discard any non-call stage and emit terminal success with `max_tokens`. If any function call was added or completed, emit a 502 stream error and no success terminator |
 | `response.failed`, `error` | Emit one Anthropic error and close without success terminator |
+| unknown auxiliary event | Emit a fixed-context warning and continue; enclosing item closure remains authoritative |
 
-Duplicate events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, unknown item/event types, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
+Duplicate translated-state events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Unknown item types, unknown content parts, auxiliary events, and SSE transport fields warn and remain invisible when `output_item.done` can still close the enclosing item. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
 
 ### 10.3 Anthropic event bytes and usage
 

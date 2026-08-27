@@ -48,9 +48,16 @@ export interface ResponsesReasoningItem {
   status?: string;
 }
 
+export interface ResponsesOpaqueItem {
+  readonly [key: string]: unknown;
+  readonly type: string;
+  readonly id?: string;
+  readonly status?: string;
+}
+
 export interface CompletedContinuationItem {
   outputIndex: number;
-  item: ResponsesFunctionCallItem | ResponsesReasoningItem;
+  item: ResponsesFunctionCallItem | ResponsesReasoningItem | ResponsesOpaqueItem;
 }
 
 export interface ContinuationCall {

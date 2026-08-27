@@ -203,6 +203,7 @@ test('continuation store rejects inconsistent call mappings and timestamps', () 
   try {
     const invalidTimestampId = '33333333-3333-4333-8333-333333333333';
     const mismatchedCallId = '44444444-4444-4444-8444-444444444444';
+    const mismatchedArgumentsId = '55555555-5555-4555-8555-555555555555';
     writeFileSync(join(directory, `${invalidTimestampId}.json`), JSON.stringify({
       ...record(invalidTimestampId),
       lastAccessedAt: 31,
@@ -216,6 +217,13 @@ test('continuation store rejects inconsistent call mappings and timestamps', () 
         name: 'test',
         input: {},
       }]],
+    }), 'utf8');
+    writeFileSync(join(directory, `${mismatchedArgumentsId}.json`), JSON.stringify({
+      ...record(mismatchedArgumentsId),
+      items: [{
+        ...record().items[0],
+        item: { ...record().items[0].item, arguments: '{"tampered":true}' },
+      }],
     }), 'utf8');
 
     const store = new ContinuationStore(directory);
@@ -249,6 +257,34 @@ test('continuation store enforces user-only Unix permissions', { skip: process.p
     assert.equal(statSync(directory).mode & 0o777, 0o700);
     assert.equal(statSync(join(directory, `${GROUP_ID}.json`)).mode & 0o777, 0o600);
     assert.equal(statSync(join(directory, '.owner')).mode & 0o777, 0o600);
+    store.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('continuation store preserves opaque completed response items', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'copilot-relay-store-'));
+  const value: PersistedContinuationGroupV1 = {
+    ...record(),
+    items: [
+      {
+        outputIndex: 0,
+        item: {
+          id: 'search-item',
+          type: 'web_search_call',
+          status: 'completed',
+          action: { type: 'search' },
+        },
+      },
+      { ...record().items[0], outputIndex: 1 },
+    ],
+    calls: [[TOOL_ID, { ...record().calls[0][1], outputIndex: 1 }]],
+  };
+  try {
+    const store = new ContinuationStore(directory);
+    store.write(value);
+    assert.deepEqual(store.load(), [value]);
     store.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });

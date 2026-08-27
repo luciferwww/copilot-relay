@@ -663,14 +663,28 @@ function failure(status: number, type: SafeFailure['type'], message: string): Sa
 function isSafeFailure(value: unknown): value is SafeFailure {
   return (
     isRecord(value) &&
-    typeof value.status === 'number' &&
-    typeof value.type === 'string' &&
-    typeof value.message === 'string'
+    Number.isInteger(value.status) &&
+    (value.status as number) >= 400 &&
+    (value.status as number) <= 599 &&
+    isFailureType(value.type) &&
+    typeof value.message === 'string' &&
+    value.message.trim().length > 0 &&
+    (value.code === undefined || typeof value.code === 'string')
+  );
+}
+
+function isFailureType(value: unknown): value is SafeFailure['type'] {
+  return (
+    value === 'invalid_request_error' ||
+    value === 'authentication_error' ||
+    value === 'permission_error' ||
+    value === 'rate_limit_error' ||
+    value === 'api_error'
   );
 }
 
 function requireModelId(body: Record<string, unknown>): string {
-  if (typeof body.model !== 'string' || body.model.length === 0) {
+  if (typeof body.model !== 'string' || body.model.trim().length === 0) {
     throw failure(400, 'invalid_request_error', 'model must be a non-empty string.');
   }
   return body.model;

@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import {
   AUTH_FILE,
   CONFIG_FILE,
@@ -23,8 +23,22 @@ import {
   saveAuth,
 } from './auth/copilot.js';
 import { startServer } from './server.js';
+import { mergeCodexConfig } from './codex-config.js';
+import { writeTextFileAtomically } from './atomic-file.js';
 
 const program = new Command();
+
+function parsePort(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new InvalidArgumentError('Port must contain decimal digits only.');
+  }
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new InvalidArgumentError('Port must be an integer from 1 to 65535.');
+  }
+  return port;
+}
+
 program
   .name('copilot-relay')
   .description('Local proxy exposing OpenAI/Anthropic APIs backed by GitHub Copilot.')
@@ -34,7 +48,7 @@ program
   .command('start')
   .description('Start the proxy server in the foreground.')
   .option('-H, --host <host>', 'Address to bind (default: 127.0.0.1)')
-  .option('-p, --port <port>', 'Port to listen on', (v) => parseInt(v, 10))
+  .option('-p, --port <port>', 'Port to listen on', parsePort)
   .option('-l, --log-level <level>', 'debug|info|warn|error')
   .option('--allow-remote-access', 'Acknowledge unauthenticated non-loopback access')
   .action(async (opts: {
@@ -51,7 +65,7 @@ program
       }
       cfg.host = opts.host;
     }
-    if (opts.port) cfg.port = opts.port;
+    if (opts.port !== undefined) cfg.port = opts.port;
     if (opts.logLevel) cfg.logLevel = opts.logLevel;
     setLevel(cfg.logLevel);
     try {
@@ -230,7 +244,7 @@ const configureCmd = program
 configureCmd
   .command('claude')
   .description('Write ~/.claude/settings.json to route Claude Code through this proxy.')
-  .option('--port <port>', 'Proxy port', (v) => parseInt(v, 10))
+  .option('--port <port>', 'Proxy port', parsePort)
   .action((opts: { port?: number }) => {
     const cfg = loadConfig();
     const port = opts.port ?? cfg.port;
@@ -254,13 +268,28 @@ configureCmd
 
 configureCmd
   .command('codex')
-  .description('(v0.2) Write Codex CLI settings.')
-  .action(() => {
-    logger.error(
-      'Codex configuration is not implemented. ' +
-        'A future release can add it after the Codex CLI config schema is confirmed.',
-    );
-    process.exit(2);
+  .description('Merge a native Responses provider into ~/.codex/config.toml.')
+  .option('--port <port>', 'Proxy port', parsePort)
+  .option('--model <model>', 'Codex model id')
+  .action((opts: { port?: number; model?: string }) => {
+    const cfg = loadConfig();
+    const port = opts.port ?? cfg.port;
+    if (opts.model !== undefined && opts.model.trim() === '') {
+      logger.error('Invalid model. Use a non-empty model id.');
+      process.exitCode = 1;
+      return;
+    }
+    const configPath = join(homedir(), '.codex', 'config.toml');
+    mkdirSync(dirname(configPath), { recursive: true });
+    const existing = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+    try {
+      const merged = mergeCodexConfig(existing, { port, model: opts.model });
+      writeTextFileAtomically(configPath, merged);
+      console.log('Wrote ' + configPath);
+    } catch (error) {
+      logger.error(error instanceof Error ? error.message : 'Could not merge Codex config.');
+      process.exitCode = 1;
+    }
   });
 
 program.parseAsync(process.argv).catch(() => {

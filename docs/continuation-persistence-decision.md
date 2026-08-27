@@ -110,6 +110,7 @@ The cheapest acceptance check is a restart test: publish a group into a temporar
 
 ## 8. Deferred choices
 
+- Recovery policy for records whose creation or access timestamps are materially later than the current clock. This requires an explicit clock-rollback/skew contract and TTL relationship before validation can reject such records safely.
 - Encryption at rest backed by an OS credential vault or an externally supplied key with a meaningfully separate security boundary.
 - Shared or remote persistence.
 - Multiple active relay processes over one store.

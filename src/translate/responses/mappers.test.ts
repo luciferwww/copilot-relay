@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setLevel } from '../../logger.js';
 import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { ContinuationRegistry } from './ContinuationRegistry.js';
 import { mapMessagesRequest } from './request-mapper.js';
@@ -67,19 +68,34 @@ test('request mapper emits the minimal stateless Responses request', () => {
   assert.equal('previous_response_id' in mapped.body, false);
 });
 
-test('request mapper fails closed on unsupported fields', () => {
-  assert.throws(
-    () => mapMessagesRequest(
+test('request mapper warns and ignores unknown top-level fields', () => {
+  const extensionValue = 'TOP_LEVEL_EXTENSION_VALUE_SENTINEL';
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => { lines.push(values.join(' ')); };
+  setLevel('warn');
+  let mapped;
+  try {
+    mapped = mapMessagesRequest(
       {
         model: 'gpt-test',
         max_tokens: 32,
         top_k: 1,
+        future_setting: extensionValue,
         messages: [{ role: 'user', content: 'hello' }],
       },
       createContext(),
-    ),
-    TranslationError,
-  );
+    );
+  } finally {
+    setLevel('error');
+    console.log = originalLog;
+  }
+
+  assert.equal('top_k' in mapped.body, false);
+  assert.equal('future_setting' in mapped.body, false);
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every((line) => line.includes('translation.fields_ignored')));
+  assert.equal(lines.some((line) => line.includes(extensionValue)), false);
 });
 
 test('request mapper accepts the narrow Claude Code request envelope', () => {
@@ -155,20 +171,131 @@ test('request mapper maps an explicit Anthropic custom tool to a Copilot functio
   assert.equal(mapped.body.parallel_tool_calls, true);
 });
 
-test('request mapper rejects Anthropic server tools that cannot run through Copilot', () => {
-  assert.throws(
-    () => mapMessagesRequest(
+test('request mapper ignores custom tool extension fields', () => {
+  const extensionValue = 'EXTENSION_VALUE_SENTINEL';
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => { lines.push(values.join(' ')); };
+  setLevel('warn');
+  let mapped;
+  try {
+    mapped = mapMessagesRequest(
       {
         model: 'gpt-test',
         max_tokens: 32,
         messages: [{ role: 'user', content: 'search the web' }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        tools: [{
+          type: 'custom',
+          name: 'WebSearch',
+          description: 'Search the web',
+          input_schema: { type: 'object', properties: {} },
+          allowed_domains: [extensionValue],
+        }],
       },
       createContext(),
-    ),
-    (error: unknown) => error instanceof TranslationError &&
-      error.failure.message === 'Only custom tools are supported.',
+    );
+  } finally {
+    setLevel('error');
+    console.log = originalLog;
+  }
+
+  assert.deepEqual(mapped.body.tools, [{
+    type: 'function',
+    name: 'WebSearch',
+    description: 'Search the web',
+    parameters: { type: 'object', properties: {} },
+  }]);
+  assert.equal(lines.length, 1);
+  assert.match(
+    lines[0] ?? '',
+    /translation\.fields_ignored \{"context":"custom-tool","fields":\["allowed_domains"\]\}/,
   );
+  assert.equal(lines[0]?.includes(extensionValue), false);
+});
+
+test('request mapper maps hosted Web Search and preserves its domain allowlist', () => {
+  const ignoredValue = 'IGNORED_EXTENSION_VALUE_SENTINEL';
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => { lines.push(values.join(' ')); };
+  setLevel('warn');
+  let mapped;
+  try {
+    mapped = mapMessagesRequest(
+      {
+        model: 'gpt-test',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: 'search the web' }],
+        tools: [{
+          type: 'web_search_20990101',
+          name: 'SearchOfficialDocs',
+          allowed_domains: ['developers.openai.com', 'github.com'],
+          future_extension: ignoredValue,
+        }],
+        tool_choice: { type: 'tool', name: 'SearchOfficialDocs' },
+      },
+      createContext(),
+    );
+  } finally {
+    setLevel('error');
+    console.log = originalLog;
+  }
+
+  assert.deepEqual(mapped.body.tools, [{
+    type: 'web_search',
+    filters: { allowed_domains: ['developers.openai.com', 'github.com'] },
+  }]);
+  assert.deepEqual(mapped.body.tool_choice, { type: 'web_search' });
+  assert.equal(lines.length, 1);
+  assert.match(
+    lines[0] ?? '',
+    /translation\.fields_ignored \{"context":"web-search-tool","fields":\["future_extension"\]\}/,
+  );
+  assert.equal(lines[0]?.includes(ignoredValue), false);
+});
+
+test('request mapper degrades invalid Web Search filters and passes unknown tools upstream', () => {
+  const mapped = mapMessagesRequest(
+    {
+      model: 'gpt-test',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'use available tools' }],
+      tools: [
+        {
+          type: 'web_search_20990101',
+          name: 'Search',
+          allowed_domains: 'future-shape',
+        },
+        {
+          type: 'future_hosted_tool',
+          name: 'FutureTool',
+          future_option: { enabled: true },
+        },
+      ],
+      tool_choice: {
+        type: 'future_choice',
+        name: 'FutureTool',
+        disable_parallel_tool_use: true,
+        future_option: true,
+      },
+    },
+    createContext(),
+  );
+
+  assert.deepEqual(mapped.body.tools, [
+    { type: 'web_search' },
+    {
+      type: 'future_hosted_tool',
+      name: 'FutureTool',
+      future_option: { enabled: true },
+    },
+  ]);
+  assert.deepEqual(mapped.body.tool_choice, {
+    type: 'future_choice',
+    name: 'FutureTool',
+    future_option: true,
+  });
+  assert.equal(mapped.body.parallel_tool_calls, false);
 });
 
 test('request mapper maps VS Code system messages in place', () => {
@@ -223,18 +350,16 @@ test('request mapper rejects broader system message shapes', () => {
   }
 });
 
-test('request mapper rejects unsupported output configuration', () => {
+test('request mapper ignores unsupported output configuration', () => {
   const variants = [
     {},
     { effort: 'max' },
     { effort: '' },
     { effort: 1 },
-    { effort: 'medium', format: { type: 'json_schema' } },
   ];
 
   for (const outputConfig of variants) {
-    assert.throws(
-      () => mapMessagesRequest(
+    const mapped = mapMessagesRequest(
         {
           model: 'gpt-test',
           max_tokens: 32,
@@ -242,13 +367,12 @@ test('request mapper rejects unsupported output configuration', () => {
           output_config: outputConfig,
         },
         createContext(),
-      ),
-      TranslationError,
-    );
+      );
+    assert.equal(mapped.body.reasoning, undefined);
   }
 });
 
-test('request mapper requires valid reasoning-effort metadata', () => {
+test('request mapper ignores reasoning effort when capability metadata is unavailable', () => {
   const supportsVariants = [
     { streaming: true },
     { streaming: true, reasoning_effort: true },
@@ -258,8 +382,7 @@ test('request mapper requires valid reasoning-effort metadata', () => {
   for (const supports of supportsVariants) {
     const context = createContext();
     context.model.capabilities = { ...context.model.capabilities, supports };
-    assert.throws(
-      () => mapMessagesRequest(
+    const mapped = mapMessagesRequest(
         {
           model: 'gpt-test',
           max_tokens: 32,
@@ -267,40 +390,59 @@ test('request mapper requires valid reasoning-effort metadata', () => {
           output_config: { effort: 'medium' },
         },
         context,
-      ),
-      (error: unknown) => error instanceof TranslationError && error.failure.status === 502,
-    );
+      );
+    assert.equal(mapped.body.reasoning, undefined);
   }
 });
 
-test('request mapper rejects broader metadata and cache-control shapes', () => {
-  const requests = [
-    { metadata: { user_id: 'user', extra: true }, content: 'hello' },
-    { metadata: { user_id: 42 }, content: 'hello' },
+test('request mapper ignores metadata, output, and cache-control extensions', () => {
+  const mapped = mapMessagesRequest(
     {
-      metadata: { user_id: 'user' },
-      content: [{ type: 'text', text: 'hello', cache_control: { type: 'persistent' } }],
+      model: 'gpt-test',
+      max_tokens: 32,
+      metadata: { user_id: 'user', future_field: true },
+      output_config: { effort: 'medium', future_format: { type: 'json' } },
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: 'hello',
+          cache_control: { type: 'future-cache', ttl: 60 },
+        }],
+      }],
     },
-    {
-      metadata: { user_id: 'user' },
-      content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: 60 } }],
-    },
-  ];
+    createContext(),
+  );
 
-  for (const request of requests) {
-    assert.throws(
-      () => mapMessagesRequest(
-        {
-          model: 'gpt-test',
-          max_tokens: 32,
-          metadata: request.metadata,
-          messages: [{ role: 'user', content: request.content }],
-        },
-        createContext(),
-      ),
-      TranslationError,
-    );
-  }
+  assert.deepEqual(mapped.body.metadata, { user_id: 'user' });
+  assert.deepEqual(mapped.body.reasoning, { effort: 'medium' });
+  const invalidMetadata = mapMessagesRequest(
+      {
+        model: 'gpt-test',
+        max_tokens: 32,
+        metadata: { user_id: 42 },
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+      createContext(),
+  );
+  assert.equal(invalidMetadata.body.metadata, undefined);
+});
+
+test('request mapper ignores malformed optional tools and choices', () => {
+  const mapped = mapMessagesRequest(
+    {
+      model: 'gpt-test',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [{ type: 'custom', name: '', input_schema: null }, 42],
+      tool_choice: 'future-choice-shape',
+    },
+    createContext(),
+  );
+
+  assert.equal(mapped.body.tools, undefined);
+  assert.equal(mapped.body.tool_choice, undefined);
+  assert.equal(mapped.body.parallel_tool_calls, undefined);
 });
 
 test('response mapper rejects incomplete output containing a completed function call', () => {
@@ -352,6 +494,72 @@ test('response mapper stages a completed function call for publication', () => {
   assert.ok(mapped.stage);
   const group = context.registry.publish(mapped.stage);
   assert.equal(group.calls.size, 1);
+});
+
+test('response mapper ignores hosted output and preserves the final text', () => {
+  const mapped = mapResponsesResult(
+    {
+      id: 'response-id',
+      model: 'gpt-test',
+      status: 'completed',
+      output: [
+        { type: 'reasoning', summary: [] },
+        {
+          id: 'search-item',
+          type: 'web_search_call',
+          status: 'completed',
+          action: { type: 'search' },
+        },
+        {
+          type: 'message',
+          status: 'completed',
+          role: 'assistant',
+          content: [
+            { type: 'future_annotation', value: 'ignored' },
+            { type: 'output_text', text: 'answer' },
+          ],
+        },
+      ],
+      usage: { input_tokens: 5, output_tokens: 7 },
+    },
+    createContext(),
+  );
+
+  assert.deepEqual(mapped.message.content, [{ type: 'text', text: 'answer' }]);
+  assert.equal(mapped.message.stop_reason, 'end_turn');
+  assert.equal(mapped.stage, undefined);
+});
+
+test('response mapper preserves opaque hosted output beside a function continuation', () => {
+  const context = createContext();
+  const mapped = mapResponsesResult(
+    {
+      id: 'response-id',
+      model: 'gpt-test',
+      status: 'completed',
+      output: [
+        {
+          id: 'search-item',
+          type: 'web_search_call',
+          status: 'completed',
+          action: { type: 'search' },
+        },
+        {
+          type: 'function_call',
+          status: 'completed',
+          call_id: 'call-id',
+          name: 'lookup',
+          arguments: '{}',
+        },
+      ],
+      usage: { input_tokens: 5, output_tokens: 7 },
+    },
+    context,
+  );
+
+  assert.ok(mapped.stage);
+  const group = context.registry.publish(mapped.stage);
+  assert.deepEqual(group.items.map(({ item }) => item.type), ['web_search_call', 'function_call']);
 });
 
 test('request mapper replays multiple closed continuation groups in history order', () => {

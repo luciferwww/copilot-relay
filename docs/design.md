@@ -6,6 +6,8 @@
 
 > Decision record: [Continuation Persistence](./continuation-persistence-decision.md) defines the implemented bounded plaintext JSON per-group store protected by the OS user boundary behind `ContinuationRegistry`.
 
+> Design principle: [Protocol Compatibility](./protocol-compatibility-principle.md) defines why every relay boundary is tolerant by default and identifies the integrity conditions that remain strict.
+
 > [!NOTE]
 > Diagrams in this document use Mermaid syntax. Open the preview pane in VS Code (`Ctrl+Shift+V` or the button in the top-right) to view them rendered; the `bierner.markdown-mermaid` extension is required (installed in this workspace). GitHub renders Mermaid natively — no extra setup.
 
@@ -333,17 +335,17 @@ The external route does not join an internal catalog refresh, share its response
 
 ### 6.1 Request validation
 
-The request mapper parses unknown JSON into boundary types and applies the closed mapping matrix defined in `spec.md`. Each field and content-block variant has one disposition: exact mapping, documented transformation, or rejection. Validation completes before any upstream `/responses` call.
+The request mapper parses unknown JSON into boundary types and applies the open compatibility matrix defined in `spec.md`: verified mapping, target-compatible passthrough, warning plus omission, or rejection only when continuation is impossible. Required validation completes before any upstream `/responses` call.
 
-Validation combines protocol rules with the selected model record. Unsupported semantics such as non-empty `stop_sequences`, `top_k`, and URL image sources produce typed `invalid_request_error` results. A boolean `tool_result.is_error` is accepted and consumed while its text content maps to `function_call_output`, because Responses has no equivalent error flag. One base64 image receives local declared-media-type, encoding, encoded-size, count, and vision-capability checks without decoding, then maps to a Responses `input_image.image_url` data URL. The verified Copilot endpoint rejects external image URLs, so the relay never resolves or fetches them.
+Validation combines protocol rules with the selected model record. Optional semantics without an equivalent, such as `stop_sequences`, `top_k`, cache hints, and URL image sources, are omitted with structured warnings; the relay never resolves or fetches external images. A boolean `tool_result.is_error` is consumed while its text maps to `function_call_output`. One valid base64 image receives local media-type, encoding, size, count, and vision-capability checks, then maps to a Responses data URL.
 
-Claude Code CLI 2.1.39 and official VS Code extension 2.1.233 through 2.1.234 compatibility remain inside the closed mapper rather than adding client-specific preprocessing layers. The mapper accepts only `{user_id:string}` as top-level metadata and maps it to Responses metadata, normalizes an empty tools array to absent tools, and recognizes only `{type:'ephemeral'}` as a cache hint on `text`, `tool_use`, and `tool_result` blocks. Cache hints are validated and consumed but not forwarded because the verified Copilot Responses contract exposes no equivalent. A VS Code `messages` entry with `role:'system'` accepts a non-empty string or a non-empty array whose every content block is text, maps in place to Responses system `input_text`, and remains distinct from top-level Anthropic `system` instructions. VS Code `output_config` is accepted only as `{effort:string}`. The mapper requires live `capabilities.supports.reasoning_effort` to be an array of strings containing that exact effort, then maps it to Responses `reasoning:{effort}`. Missing or malformed required support metadata is an upstream-metadata error; an unadvertised effort is a client error. No other unknown field is discarded.
+Compatibility stays in the generic boundary mapper rather than client-version branches. Unknown optional object fields warn and are omitted; versioned tool families map by stable prefix; unknown target-shaped tools pass through. Optional metadata, system content, reasoning controls, custom tools, or images that cannot construct their own Responses component are omitted with warning. Required request input and continuation fields remain strict.
 
 When tool results are present, validation resolves the continuation group before constructing Responses input. The historical block must preserve the emitted tool id and name. Its input must be a projection of the authoritative input with identical retained values; only top-level authoritative fields whose value is exactly `false` may be absent, matching Claude Code's observed removal of explicit tool defaults. Added fields, changed values, nested normalization, and omission of any other value are rejected. The mapper replays the authoritative completed function-call and reasoning items followed by `function_call_output` items keyed by the stored `call_id`; client-visible assistant text or normalized input is never substituted for opaque Responses state.
 
 ### 6.2 Non-streaming output
 
-The output mapper accepts only observed and documented Copilot Responses shapes. It maps text, function calls, usage, and completion reason into one Anthropic Message. Unknown output item types or structurally invalid payloads produce an Anthropic 502 because the upstream contract, not the client request, was violated.
+The output mapper maps text, function calls, usage, and completion reason into one Anthropic Message. Unknown output/content variants warn and remain client-invisible. Completed opaque items are retained only when needed beside a function continuation so the exact upstream sequence can be replayed. Structurally invalid required data still produces an Anthropic 502.
 
 ### 6.3 Streaming output
 
@@ -352,7 +354,7 @@ The SSE translator has two layers:
 1. A transport parser converts arbitrary UTF-8 byte chunks into complete SSE events while preserving split code points and multi-line `data` fields.
 2. A protocol state machine converts documented Responses events into ordered Anthropic events and accumulates only bounded tool-argument fragments until the relevant content block closes.
 
-Unknown ignorable transport fields may be ignored only when `spec.md` explicitly permits them. Unknown Responses event types, invalid transitions, malformed JSON, excessive buffered state, and premature EOF are upstream protocol failures and terminate with an Anthropic stream error.
+Unknown transport fields, auxiliary Responses events, opaque output items, and unknown content parts warn and are ignored while the enclosing item can still close coherently. Invalid transitions for translated text/function data, malformed JSON, excessive buffered state, and premature EOF remain upstream protocol failures.
 
 ## 7. Transport Boundary
 
@@ -469,6 +471,6 @@ Reserved but **not implemented in v0.2**:
 | Concurrent auth refreshes complete out of order | New token or validity state is overwritten | Generation-scoped single-flight and compare-before-commit |
 | Copilot Responses differs from public OpenAI Responses | Translation fails or corrupts semantics | Live probes gate completion; observed shapes become spec fixtures |
 | Required Responses continuation state is unavailable or expires | A tool-result turn cannot continue | Bounded local registry, authoritative completed items, explicit 400; never guess or depend silently on upstream storage |
-| Unknown or reordered SSE events | Invalid Anthropic stream | Strict state machine, bounded buffers, fail closed with stream error |
+| Unknown or reordered SSE events | Version drift or invalid Anthropic stream | Ignore and warn for auxiliary unknown events; keep strict ordering and closure checks for translated state |
 | Slow or disconnected downstream accumulates translated output | Memory growth and wasted quota | Backpressure-aware writes, deadlines, bounded parser state, unified abort cleanup |
 | Translation retry duplicates model execution | Duplicate model work or tool call | Retry only for 401 or probed pre-execution endpoint rejection; ambiguous failures are terminal; one coordinator caps total attempts |

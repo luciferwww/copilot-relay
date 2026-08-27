@@ -398,11 +398,16 @@ function isValidRecord(value: unknown): value is PersistedContinuationGroupV1 {
       return false;
     }
     const item = value.items.find((candidate) => candidate.outputIndex === call.outputIndex)?.item;
+    const parsedArguments = item?.type === 'function_call'
+      ? parseJsonObject(item.arguments)
+      : undefined;
     if (
       !item ||
       item.type !== 'function_call' ||
       item.call_id !== call.callId ||
-      item.name !== call.name
+      item.name !== call.name ||
+      !parsedArguments ||
+      !jsonEqual(parsedArguments, call.input)
     ) {
       return false;
     }
@@ -431,7 +436,9 @@ function isContinuationItem(value: unknown): value is CompletedContinuationItem 
       && (item.status === undefined || typeof item.status === 'string')
       && (item.id === undefined || typeof item.id === 'string');
   }
-  return false;
+  return isNonEmptyString(item.type)
+    && (item.status === undefined || typeof item.status === 'string')
+    && (item.id === undefined || typeof item.id === 'string');
 }
 
 function isContinuationCall(value: unknown): value is ContinuationCall {
@@ -446,6 +453,30 @@ function isContinuationCall(value: unknown): value is ContinuationCall {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function jsonEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((entry, index) => jsonEqual(entry, right[index]));
+  }
+  if (isRecord(left) && isRecord(right)) {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key, index) =>
+        key === rightKeys[index] && jsonEqual(left[key], right[key]));
+  }
+  return false;
 }
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
