@@ -1,11 +1,6 @@
-import type {
-  ContinuationStage,
-  MappingContext,
-  ResponsesFunctionCallItem,
-  ResponsesOpaqueItem,
-  ResponsesReasoningItem,
-} from './types.js';
+import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { logger } from '../../logger.js';
+import { matchesRequestedModel } from '../shared.js';
 import {
   SSE_FRAME_MAX_BYTES,
   STREAM_TEXT_MAX_BYTES,
@@ -36,11 +31,11 @@ interface ActiveItem {
 
 /** Incrementally translates a strict Responses SSE stream into Anthropic SSE frames. */
 export class SseTranslator {
-  private readonly context: MappingContext;
+  private readonly context: { readonly model: ModelRecord };
   private readonly writer: SseWriter;
   private readonly decoder = new TextDecoder('utf-8', { fatal: true });
-  private readonly stage: ContinuationStage;
   private readonly itemIds = new Set<string>();
+  private readonly callIds = new Set<string>();
   private pending = '';
   private responseId?: string;
   private active?: ActiveItem;
@@ -50,12 +45,10 @@ export class SseTranslator {
   private terminal = false;
   private aborted = false;
   private hasFunctionCall = false;
-  private published = false;
 
-  constructor(context: MappingContext, writer: SseWriter) {
+  constructor(context: { readonly model: ModelRecord }, writer: SseWriter) {
     this.context = context;
     this.writer = writer;
-    this.stage = context.registry.createStage(context.model.id);
   }
 
   async push(chunk: Uint8Array): Promise<void> {
@@ -87,7 +80,6 @@ export class SseTranslator {
   abort(): void {
     if (this.aborted) return;
     this.aborted = true;
-    if (!this.published) this.context.registry.discard(this.stage);
   }
 
   private async consumeFrames(): Promise<void> {
@@ -234,14 +226,15 @@ export class SseTranslator {
     if (type === 'function_call') {
       const name = requireNonEmptyString(item.name, 'function name');
       const callId = requireNonEmptyString(item.call_id, 'function call id');
-      const toolId = this.context.registry.allocateToolId(this.stage);
+      if (this.callIds.has(callId)) protocol('Responses function call id was duplicated.');
+      this.callIds.add(callId);
       const blockIndex = this.nextBlockIndex++;
-      Object.assign(this.active, { name, callId, toolId, blockIndex });
+      Object.assign(this.active, { name, callId, toolId: callId, blockIndex });
       this.hasFunctionCall = true;
       await this.emit('content_block_start', {
         type: 'content_block_start',
         index: blockIndex,
-        content_block: { type: 'tool_use', id: toolId, name, input: {} },
+        content_block: { type: 'tool_use', id: callId, name, input: {} },
       });
     }
   }
@@ -386,18 +379,7 @@ export class SseTranslator {
       if (item.call_id !== active.callId || item.name !== active.name || item.arguments !== active.arguments) {
         protocol('Completed function call does not match its deltas.');
       }
-      const parsed = parseArguments(active.arguments);
-      const authoritative = item as unknown as ResponsesFunctionCallItem;
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: authoritative,
-      });
-      this.context.registry.addCall(this.stage, active.toolId, {
-        callId: active.callId as string,
-        outputIndex: active.outputIndex,
-        name: active.name as string,
-        input: parsed,
-      });
+      parseArguments(active.arguments);
       await this.emit('content_block_stop', {
         type: 'content_block_stop',
         index: active.blockIndex,
@@ -406,15 +388,6 @@ export class SseTranslator {
       if (item.status !== undefined && item.status !== 'completed') {
         protocol('Reasoning item is incomplete.');
       }
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: item as unknown as ResponsesReasoningItem,
-      });
-    } else {
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: item as unknown as ResponsesOpaqueItem,
-      });
     }
     this.active = undefined;
     this.nextOutputIndex += 1;
@@ -435,14 +408,8 @@ export class SseTranslator {
       ) {
         protocol('Incomplete response cannot complete this stream.');
       }
-      this.context.registry.discard(this.stage);
     } else if (response.status !== 'completed') {
       protocol('Completed response status is invalid.');
-    } else if (this.hasFunctionCall) {
-      this.context.registry.publish(this.stage);
-      this.published = true;
-    } else {
-      this.context.registry.discard(this.stage);
     }
     const stopReason = incomplete ? 'max_tokens' : this.hasFunctionCall ? 'tool_use' : 'end_turn';
     await this.emit('message_delta', {
@@ -457,7 +424,9 @@ export class SseTranslator {
   private validateResponseIdentity(value: unknown, initialize = false): Record<string, unknown> {
     const response = requireRecord(value, 'response');
     const id = requireNonEmptyString(response.id, 'response id');
-    if (response.model !== this.context.model.id) protocol('Response model does not match the request.');
+    if (!matchesRequestedModel(response.model, this.context.model.id)) {
+      protocol('Response model does not match the request.');
+    }
     if (initialize) this.responseId = id;
     return response;
   }

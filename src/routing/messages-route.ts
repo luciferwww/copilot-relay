@@ -3,6 +3,7 @@ import type { SafeFailure } from '../translate/responses/types.js';
 
 export type MessagesRoutePlan =
   | { kind: 'messages-passthrough'; modelId: string }
+  | { kind: 'chat-translation'; modelId: string; model: ModelRecord }
   | { kind: 'responses-translation'; modelId: string; model: ModelRecord }
   | { kind: 'client-error'; error: SafeFailure }
   | { kind: 'upstream-metadata-error'; error: SafeFailure };
@@ -22,6 +23,10 @@ export function planMessagesRoute(modelId: string, model: ModelRecord): Messages
 
   if (model.supported_endpoints.includes('/v1/messages')) {
     return { kind: 'messages-passthrough', modelId };
+  }
+
+  if (model.supported_endpoints.includes('/chat/completions')) {
+    return { kind: 'chat-translation', modelId, model };
   }
 
   if (model.supported_endpoints.includes('/responses')) {

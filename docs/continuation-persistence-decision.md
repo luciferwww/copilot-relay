@@ -1,6 +1,6 @@
 # Continuation Persistence Decision
 
-Status: accepted and implemented for the first post-v0.2 persistence release.
+Status: superseded 2026-09-15 by [Stateless Messages Translation](./stateless-messages-translation-decision.md). Retained as a historical record of the removed implementation.
 
 This record resolves the storage choices required by `requirement.md`, `design.md`, and `spec.md`. Those files remain authoritative for product behavior and the implementation contract.
 

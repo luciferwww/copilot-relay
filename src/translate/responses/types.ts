@@ -1,5 +1,3 @@
-import type { ModelRecord } from '../../models/ModelCatalog.js';
-
 export const REQUEST_BODY_MAX_BYTES = 8 * 1024 * 1024;
 export const NON_STREAM_RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 export const ERROR_BODY_MAX_BYTES = 64 * 1024;
@@ -31,75 +29,6 @@ export class TranslationError extends Error {
   }
 }
 
-export interface ResponsesFunctionCallItem {
-  id?: string;
-  type: 'function_call';
-  call_id: string;
-  name: string;
-  arguments: string;
-  status?: string;
-}
-
-export interface ResponsesReasoningItem {
-  id?: string;
-  type: 'reasoning';
-  encrypted_content?: string;
-  summary?: readonly unknown[];
-  status?: string;
-}
-
-export interface ResponsesOpaqueItem {
-  readonly [key: string]: unknown;
-  readonly type: string;
-  readonly id?: string;
-  readonly status?: string;
-}
-
-export interface CompletedContinuationItem {
-  outputIndex: number;
-  item: ResponsesFunctionCallItem | ResponsesReasoningItem | ResponsesOpaqueItem;
-}
-
-export interface ContinuationCall {
-  callId: string;
-  outputIndex: number;
-  name: string;
-  input: Readonly<Record<string, unknown>>;
-}
-
-export interface ContinuationGroup {
-  groupId: string;
-  modelId: string;
-  createdAt: number;
-  lastAccessedAt: number;
-  expiresAt: number;
-  items: readonly CompletedContinuationItem[];
-  calls: ReadonlyMap<string, ContinuationCall>;
-  byteSize: number;
-}
-
-export interface ContinuationStage {
-  readonly groupId: string;
-  readonly modelId: string;
-  readonly items: CompletedContinuationItem[];
-  readonly calls: Map<string, ContinuationCall>;
-  published: boolean;
-  discarded: boolean;
-}
-
-export interface MappingContext {
-  model: ModelRecord;
-  registry: {
-    createStage(modelId: string): ContinuationStage;
-    allocateToolId(stage: ContinuationStage): string;
-    addItem(stage: ContinuationStage, item: CompletedContinuationItem): void;
-    addCall(stage: ContinuationStage, toolId: string, call: ContinuationCall): void;
-    resolve(toolUseIds: readonly string[], modelId: string): ContinuationGroup;
-    publish(stage: ContinuationStage): ContinuationGroup;
-    discard(stage: ContinuationStage): void;
-  };
-}
-
 export interface MappedRequest {
   body: Readonly<Record<string, unknown>>;
   stream: boolean;
@@ -107,5 +36,4 @@ export interface MappedRequest {
 
 export interface MappedMessage {
   message: Readonly<Record<string, unknown>>;
-  stage?: ContinuationStage;
 }

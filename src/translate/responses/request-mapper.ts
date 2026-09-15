@@ -1,6 +1,6 @@
 import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { logger } from '../../logger.js';
-import type { ContinuationGroup, MappedRequest, MappingContext } from './types.js';
+import type { MappedRequest } from './types.js';
 import { TranslationError } from './types.js';
 
 const TOP_LEVEL_FIELDS = new Set([
@@ -19,13 +19,15 @@ const TOP_LEVEL_FIELDS = new Set([
   'output_config',
 ]);
 
-interface OpenContinuation {
-  group: ContinuationGroup;
-  remaining: Set<string>;
+interface HistoricalToolCall {
+  resultSeen: boolean;
 }
 
 /** Validates and maps one complete Anthropic Messages request. */
-export function mapMessagesRequest(input: unknown, context: MappingContext): MappedRequest {
+export function mapMessagesRequest(
+  input: unknown,
+  context: { readonly model: ModelRecord },
+): MappedRequest {
   const request = requireRecord(input, 'Request body');
   warnUnknownFields(request, TOP_LEVEL_FIELDS, 'request');
   if ('top_k' in request) {
@@ -57,19 +59,22 @@ export function mapMessagesRequest(input: unknown, context: MappingContext): Map
   if (instructions !== undefined) body.instructions = instructions;
   const metadata = mapMetadata(request.metadata);
   if (metadata !== undefined) body.metadata = metadata;
-  const reasoning = mapOutputConfig(request.output_config, context.model);
-  if (reasoning !== undefined) body.reasoning = reasoning;
+  if (request.output_config !== undefined) {
+    logger.translationFieldsIgnored({ context: 'request', fields: ['output_config'] });
+  }
   if (request.temperature !== undefined) body.temperature = request.temperature;
   if (request.top_p !== undefined) body.top_p = request.top_p;
   mapTools(request.tools, request.tool_choice, context.model, body);
   return { body, stream };
 }
 
-function mapMessages(value: unknown, context: MappingContext): readonly unknown[] {
+function mapMessages(
+  value: unknown,
+  context: { readonly model: ModelRecord },
+): readonly unknown[] {
   if (!Array.isArray(value) || value.length === 0) invalid('messages must be a non-empty array.');
   const output: unknown[] = [];
-  let open: OpenContinuation | undefined;
-  const closedGroupIds = new Set<string>();
+  const toolCalls = new Map<string, HistoricalToolCall>();
   let imageCount = 0;
 
   for (const messageValue of value) {
@@ -84,20 +89,6 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
       invalid('System message content must not be empty.');
     }
     const blocks = normalizeContent(message.content);
-    const toolUseBlocks = blocks.filter((block) => block.type === 'tool_use');
-
-    if (toolUseBlocks.length > 0) {
-      if (role !== 'assistant' || open) invalid('Tool-use groups are out of order.');
-      const ids = toolUseBlocks.map((block) => requireNonEmptyString(block.id, 'tool_use.id'));
-      const group = context.registry.resolve(ids, context.model.id);
-      if (closedGroupIds.has(group.groupId)) {
-        invalid(`Continuation group "${group.groupId}" may not be reopened.`);
-      }
-      for (const block of toolUseBlocks) validateHistoricalToolUse(block, group);
-      open = { group, remaining: new Set(ids) };
-    }
-
-    let continuationInserted = false;
     for (const block of blocks) {
       if (block.type === 'text') {
         warnUnknownFields(block, new Set(['type', 'text', 'cache_control']), 'text-block');
@@ -128,15 +119,20 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
         continue;
       }
       if (block.type === 'tool_use') {
-        if (!open) invalid('Tool use could not be resolved.');
-        if (!continuationInserted) {
-          output.push(
-            ...[...open.group.items]
-              .sort((left, right) => left.outputIndex - right.outputIndex)
-              .map((entry) => entry.item),
-          );
-          continuationInserted = true;
-        }
+        warnUnknownFields(block, new Set(['type', 'id', 'name', 'input', 'cache_control']), 'tool-use');
+        validateCacheControl(block.cache_control);
+        if (role !== 'assistant') invalid('tool_use must appear in an assistant message.');
+        const id = requireNonEmptyString(block.id, 'tool_use.id');
+        if (toolCalls.has(id)) invalid(`Duplicate tool use "${id}".`);
+        const name = requireNonEmptyString(block.name, 'tool_use.name');
+        const toolInput = requireRecord(block.input, 'tool_use.input');
+        toolCalls.set(id, { resultSeen: false });
+        output.push({
+          type: 'function_call',
+          call_id: id,
+          name,
+          arguments: JSON.stringify(toolInput),
+        });
         continue;
       }
       if (block.type === 'tool_result') {
@@ -146,29 +142,27 @@ function mapMessages(value: unknown, context: MappingContext): readonly unknown[
           'tool-result',
         );
         validateCacheControl(block.cache_control);
-        if (role !== 'user' || !open) invalid('Tool result appears before its tool use.');
+        if (role !== 'user') invalid('tool_result must appear in a user message.');
         const toolUseId = requireNonEmptyString(block.tool_use_id, 'tool_result.tool_use_id');
-        if (!open.remaining.delete(toolUseId)) invalid(`Duplicate tool result "${toolUseId}".`);
-        const call = open.group.calls.get(toolUseId);
-        if (!call) invalid(`Tool result "${toolUseId}" is unavailable.`);
+        const call = toolCalls.get(toolUseId);
+        if (!call) invalid(`Tool result "${toolUseId}" appears before its tool use.`);
+        if (call.resultSeen) invalid(`Duplicate tool result "${toolUseId}".`);
+        call.resultSeen = true;
         if (block.is_error !== undefined && typeof block.is_error !== 'boolean') {
           invalid('tool_result.is_error must be boolean when provided.');
         }
         output.push({
           type: 'function_call_output',
-          call_id: call.callId,
+          call_id: toolUseId,
           output: mapToolResultContent(block.content),
         });
-        if (open.remaining.size === 0) {
-          closedGroupIds.add(open.group.groupId);
-          open = undefined;
-        }
         continue;
       }
       logger.translationComponentIgnored({ context: 'content-block' });
     }
   }
-  if (open) invalid('A continuation group is missing tool results.');
+  const missingResult = [...toolCalls.entries()].find(([, call]) => !call.resultSeen);
+  if (missingResult) invalid(`Tool use "${missingResult[0]}" is missing its result.`);
   if (output.length === 0) invalid('messages contain no translatable content.');
   return output;
 }
@@ -177,32 +171,6 @@ function normalizeContent(value: unknown): Record<string, unknown>[] {
   if (typeof value === 'string') return [{ type: 'text', text: value }];
   if (!Array.isArray(value) || value.length === 0) invalid('Message content must be non-empty.');
   return value.map((block) => requireRecord(block, 'content block'));
-}
-
-function validateHistoricalToolUse(
-  block: Readonly<Record<string, unknown>>,
-  group: ContinuationGroup,
-): void {
-  warnUnknownFields(block, new Set(['type', 'id', 'name', 'input', 'cache_control']), 'tool-use');
-  validateCacheControl(block.cache_control);
-  const id = requireNonEmptyString(block.id, 'tool_use.id');
-  const call = group.calls.get(id);
-  if (!call) invalid(`Tool use "${id}" does not belong to its continuation group.`);
-  const name = requireNonEmptyString(block.name, 'tool_use.name');
-  const toolInput = requireRecord(block.input, 'tool_use.input');
-  if (name !== call.name || !isAllowedHistoricalInput(toolInput, call.input)) {
-    invalid(`Tool use "${id}" does not match the authoritative continuation.`);
-  }
-}
-
-function isAllowedHistoricalInput(
-  historical: Readonly<Record<string, unknown>>,
-  authoritative: Readonly<Record<string, unknown>>,
-): boolean {
-  if (Object.keys(historical).some((key) => !(key in authoritative))) return false;
-  return Object.entries(authoritative).every(([key, value]) =>
-    key in historical ? jsonEqual(historical[key], value) : value === false,
-  );
 }
 
 function mapToolResultContent(value: unknown): string {
@@ -414,37 +382,6 @@ function mapMetadata(value: unknown): Record<string, string> | undefined {
   return { user_id: metadata.user_id };
 }
 
-function mapOutputConfig(
-  value: unknown,
-  model: ModelRecord,
-): Record<string, string> | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value)) {
-    logger.translationComponentIgnored({ context: 'content-block' });
-    return undefined;
-  }
-  const outputConfig = value;
-  warnUnknownFields(outputConfig, new Set(['effort']), 'output-config');
-  if (typeof outputConfig.effort !== 'string' || outputConfig.effort.length === 0) {
-    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
-    return undefined;
-  }
-  const effort = outputConfig.effort;
-  const supportedEfforts = model.capabilities?.supports?.reasoning_effort;
-  if (
-    !Array.isArray(supportedEfforts) ||
-    !supportedEfforts.every((entry) => typeof entry === 'string')
-  ) {
-    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
-    return undefined;
-  }
-  if (!supportedEfforts.includes(effort)) {
-    logger.translationFieldsIgnored({ context: 'output-config', fields: ['effort'] });
-    return undefined;
-  }
-  return { effort };
-}
-
 function validateCacheControl(value: unknown): void {
   if (value === undefined) return;
   if (!isRecord(value)) {
@@ -520,22 +457,6 @@ function modelSupport(model: ModelRecord, name: string): boolean {
 
 function isCanonicalBase64(value: string): boolean {
   return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
-}
-
-function jsonEqual(left: unknown, right: unknown): boolean {
-  if (left === right) return true;
-  if (Array.isArray(left) && Array.isArray(right)) {
-    return left.length === right.length && left.every((entry, index) => jsonEqual(entry, right[index]));
-  }
-  if (isRecord(left) && isRecord(right)) {
-    const leftKeys = Object.keys(left).sort();
-    const rightKeys = Object.keys(right).sort();
-    return (
-      leftKeys.length === rightKeys.length &&
-      leftKeys.every((key, index) => key === rightKeys[index] && jsonEqual(left[key], right[key]))
-    );
-  }
-  return false;
 }
 
 function warnUnknownFields(

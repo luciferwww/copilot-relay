@@ -12,6 +12,14 @@ export function extractQueryString(inbound: string | undefined): string {
   return q >= 0 ? inbound.slice(q) : '';
 }
 
+export function matchesRequestedModel(value: unknown, requestedModel: string): boolean {
+  if (value === requestedModel) return true;
+  if (typeof value !== 'string') return false;
+  const versionPrefix = `${requestedModel}-`;
+  return value.startsWith(versionPrefix)
+    && /^\d{4}-\d{2}-\d{2}$/u.test(value.slice(versionPrefix.length));
+}
+
 /**
  * Spec §7.2 — build the Copilot request headers common to every upstream call.
  * The returned map covers only the always-present set (Authorization,

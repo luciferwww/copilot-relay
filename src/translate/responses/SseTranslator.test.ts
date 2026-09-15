@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRecord } from '../../models/ModelCatalog.js';
-import { ContinuationRegistry } from './ContinuationRegistry.js';
 import { SseTranslator } from './SseTranslator.js';
-import { TranslationError, type MappingContext } from './types.js';
+import { TranslationError } from './types.js';
 
 function frame(type: string, value: Record<string, unknown>): string {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`;
@@ -14,12 +13,12 @@ test('SSE translator accepts rotated opaque response and item ids', async () => 
     id: 'gpt-test',
     supported_endpoints: ['/responses'],
   };
-  const context: MappingContext = { model, registry: new ContinuationRegistry() };
+  const context = { model };
   const output: string[] = [];
   const translator = new SseTranslator(context, async (value) => {
     output.push(value);
   });
-  const responseBase = { id: 'response-id', model: 'gpt-test' };
+  const responseBase = { id: 'response-id', model: 'gpt-test-2026-03-17' };
   const source = [
     frame('response.created', { response: { ...responseBase, status: 'in_progress', usage: null } }),
     frame('response.output_item.added', {
@@ -79,7 +78,7 @@ test('SSE translator accepts rotated opaque response and item ids', async () => 
 
 test('SSE translator emits sequential text parts from one message item', async () => {
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
-  const context: MappingContext = { model, registry: new ContinuationRegistry() };
+  const context = { model };
   const output: string[] = [];
   const translator = new SseTranslator(context, async (value) => { output.push(value); });
   const responseBase = { id: 'response-id', model: 'gpt-test' };
@@ -147,7 +146,7 @@ test('SSE translator emits sequential text parts from one message item', async (
 
 test('SSE translator rejects incomplete responses after a function call', async () => {
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
-  const context: MappingContext = { model, registry: new ContinuationRegistry() };
+  const context = { model };
   const output: string[] = [];
   const translator = new SseTranslator(context, async (value) => { output.push(value); });
   const responseBase = { id: 'response-id', model: 'gpt-test' };
@@ -202,7 +201,7 @@ test('SSE translator rejects incomplete responses after a function call', async 
 
 test('SSE translator assigns safe diagnostic codes to terminal failures', async () => {
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
-  const context: MappingContext = { model, registry: new ContinuationRegistry() };
+  const context = { model };
   const responseBase = { id: 'response-id', model: 'gpt-test' };
   const upstreamFailure = new SseTranslator(context, async () => undefined);
   const source = [
@@ -226,7 +225,7 @@ test('SSE translator assigns safe diagnostic codes to terminal failures', async 
 
 test('SSE translator ignores hosted tool events and emits the final text', async () => {
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
-  const context: MappingContext = { model, registry: new ContinuationRegistry() };
+  const context = { model };
   const output: string[] = [];
   const translator = new SseTranslator(context, async (value) => { output.push(value); });
   const responseBase = { id: 'response-id', model: 'gpt-test' };

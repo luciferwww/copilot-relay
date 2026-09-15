@@ -10,7 +10,7 @@ Treating the relay as a closed-schema validator makes otherwise usable requests 
 
 ## Decision
 
-Protocol boundaries are **tolerant by default and strict only where continuation is impossible**.
+Protocol boundaries are **tolerant by default and strict where a trustworthy target exchange is impossible**.
 
 For every field, component, discriminator, item, or event, use this order:
 
@@ -27,7 +27,7 @@ The first three outcomes are successful compatibility handling. An upstream serv
 - Ignore additive object fields with a structured warning unless they have a known mapping.
 - Pass through unknown target-shaped tools and tool choices after removing source-only controls already translated elsewhere.
 - Skip unknown optional content components when other translatable content remains.
-- Treat unknown Responses output items as client-invisible opaque items. Preserve completed opaque items only when exact continuation replay requires them.
+- Treat unknown Responses output items as client-invisible opaque items. Stateless translation does not retain them for a later request.
 - Ignore unknown auxiliary SSE events and transport fields while the enclosing translated item can still close coherently.
 
 ## Strict boundaries
@@ -38,7 +38,7 @@ Tolerance does not permit the relay to manufacture a valid-looking exchange. The
 - no translatable input remains after optional components are omitted;
 - response identity, model identity, item ordering, or translated delta/done state is inconsistent;
 - function calls lack the ids, names, object arguments, or result association needed for translation;
-- continuation ids, authoritative inputs, persisted arguments, model binding, or replay ordering do not match;
+- tool-call ids, names, arguments, result associations, or ordering do not match;
 - authentication, ownership, size, count, timeout, or other resource and security invariants fail.
 
 These are protocol-integrity failures, not unknown-extension failures.
@@ -63,7 +63,7 @@ They must never contain field values, discriminator values, prompts, tool inputs
 | Unknown response output item | Hide from the Anthropic client; preserve if continuation replay needs it |
 | Unknown auxiliary SSE event | Warn and ignore while item closure remains valid |
 | Malformed function-call arguments | Reject because no trustworthy Anthropic `tool_use` can be constructed |
-| Mismatched continuation input or call id | Reject because replay association cannot be guessed |
+| Missing or conflicting tool-call id | Reject because result association cannot be guessed |
 
 ## Testing requirement
 
