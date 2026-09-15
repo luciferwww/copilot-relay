@@ -144,6 +144,105 @@ test('SSE translator emits sequential text parts from one message item', async (
   assert.equal(output.some((entry) => entry.includes('"text":"second"')), true);
 });
 
+test('SSE translator exposes refusal text and decomposes cache usage', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const output: string[] = [];
+  const translator = new SseTranslator({ model }, async (value) => { output.push(value); });
+  const responseBase = { id: 'response-id', model: 'gpt-test' };
+  const refusal = 'I cannot help with that.';
+  const source = [
+    frame('response.created', { response: { ...responseBase, status: 'in_progress', usage: null } }),
+    frame('response.output_item.added', {
+      output_index: 0,
+      item: { id: 'message-item', type: 'message', status: 'in_progress', role: 'assistant' },
+    }),
+    frame('response.content_part.added', {
+      output_index: 0,
+      item_id: 'message-item',
+      part: { type: 'refusal', refusal: '' },
+    }),
+    frame('response.refusal.delta', {
+      output_index: 0,
+      item_id: 'message-item',
+      delta: refusal,
+    }),
+    frame('response.refusal.done', {
+      output_index: 0,
+      item_id: 'message-item',
+      refusal,
+    }),
+    frame('response.content_part.done', {
+      output_index: 0,
+      item_id: 'message-item',
+      part: { type: 'refusal', refusal },
+    }),
+    frame('response.output_item.done', {
+      output_index: 0,
+      item: {
+        id: 'message-item',
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'refusal', refusal }],
+      },
+    }),
+    frame('response.completed', {
+      response: {
+        ...responseBase,
+        status: 'completed',
+        usage: {
+          input_tokens: 12,
+          input_tokens_details: { cached_tokens: 4, cache_write_tokens: 3 },
+          output_tokens: 2,
+        },
+      },
+    }),
+  ].join('');
+
+  await translator.push(new TextEncoder().encode(source));
+  await translator.finish();
+
+  assert.equal(output.some((entry) => entry.includes(`"text":"${refusal}"`)), true);
+  assert.match(output.at(-2) ?? '', /"stop_reason":"refusal"/);
+  assert.match(
+    output.at(-2) ?? '',
+    /"input_tokens":5,"cache_creation_input_tokens":3,"cache_read_input_tokens":4,"output_tokens":2/,
+  );
+});
+
+test('SSE translator rejects refusal completion that contradicts its deltas', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const translator = new SseTranslator({ model }, async () => undefined);
+  const responseBase = { id: 'response-id', model: 'gpt-test' };
+  const source = [
+    frame('response.created', { response: { ...responseBase, status: 'in_progress', usage: null } }),
+    frame('response.output_item.added', {
+      output_index: 0,
+      item: { id: 'message-item', type: 'message', status: 'in_progress', role: 'assistant' },
+    }),
+    frame('response.content_part.added', {
+      output_index: 0,
+      item_id: 'message-item',
+      part: { type: 'refusal', refusal: '' },
+    }),
+    frame('response.refusal.delta', {
+      output_index: 0,
+      item_id: 'message-item',
+      delta: 'first',
+    }),
+    frame('response.refusal.done', {
+      output_index: 0,
+      item_id: 'message-item',
+      refusal: 'different',
+    }),
+  ].join('');
+
+  await assert.rejects(
+    translator.push(new TextEncoder().encode(source)),
+    TranslationError,
+  );
+});
+
 test('SSE translator rejects incomplete responses after a function call', async () => {
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
   const context = { model };

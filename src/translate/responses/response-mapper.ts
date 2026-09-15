@@ -3,6 +3,7 @@ import type { MappedMessage } from './types.js';
 import { logger } from '../../logger.js';
 import { matchesRequestedModel } from '../shared.js';
 import { TranslationError } from './types.js';
+import { mapResponsesUsage } from '../token-usage.js';
 
 /** Maps one bounded, complete Responses JSON payload into an Anthropic Message. */
 export function mapResponsesResult(
@@ -15,9 +16,7 @@ export function mapResponsesResult(
     protocol('Response model does not match the request.');
   }
   if (!Array.isArray(response.output)) protocol('Response output is invalid.');
-  const usage = requireRecord(response.usage, 'usage');
-  const inputTokens = requireTokenCount(usage.input_tokens, 'input_tokens');
-  const outputTokens = requireTokenCount(usage.output_tokens, 'output_tokens');
+  const usage = mapResponsesUsage(response.usage);
   const incomplete = response.status === 'incomplete';
   if (response.status !== 'completed' && !incomplete) protocol('Response status is not supported.');
   if (incomplete) {
@@ -30,10 +29,11 @@ export function mapResponsesResult(
   const content: Record<string, unknown>[] = [];
   const callIds = new Set<string>();
   let hasFunctionCall = false;
+  let hasRefusal = false;
   response.output.forEach((itemValue) => {
     const item = requireRecord(itemValue, 'output item');
     if (item.type === 'message') {
-      mapMessageItem(item, content);
+      hasRefusal = mapMessageItem(item, content) || hasRefusal;
       return;
     }
     if (item.type === 'function_call') {
@@ -52,7 +52,13 @@ export function mapResponsesResult(
     protocol('Incomplete response contained a function call.');
   }
 
-  const stopReason = incomplete ? 'max_tokens' : hasFunctionCall ? 'tool_use' : 'end_turn';
+  const stopReason = incomplete
+    ? 'max_tokens'
+    : hasFunctionCall
+      ? 'tool_use'
+      : hasRefusal
+        ? 'refusal'
+        : 'end_turn';
   return {
     message: {
       id: response.id,
@@ -62,23 +68,32 @@ export function mapResponsesResult(
       content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      usage,
     },
   };
 }
 
-function mapMessageItem(item: Record<string, unknown>, output: Record<string, unknown>[]): void {
+function mapMessageItem(item: Record<string, unknown>, output: Record<string, unknown>[]): boolean {
   if (item.status !== 'completed' || item.role !== 'assistant' || !Array.isArray(item.content)) {
     protocol('Response message item is invalid.');
   }
+  let hasRefusal = false;
   for (const partValue of item.content) {
     const part = requireRecord(partValue, 'message content');
-    if (part.type !== 'output_text' || typeof part.text !== 'string') {
-      logger.translationComponentIgnored({ context: 'response-content' });
+    if (part.type === 'output_text') {
+      if (typeof part.text !== 'string') protocol('Response text content is invalid.');
+      output.push({ type: 'text', text: part.text });
       continue;
     }
-    output.push({ type: 'text', text: part.text });
+    if (part.type === 'refusal') {
+      if (typeof part.refusal !== 'string') protocol('Response refusal content is invalid.');
+      output.push({ type: 'text', text: part.refusal });
+      hasRefusal = true;
+      continue;
+    }
+    logger.translationComponentIgnored({ context: 'response-content' });
   }
+  return hasRefusal;
 }
 
 function mapFunctionCall(
@@ -115,13 +130,6 @@ function validateReasoning(item: Record<string, unknown>): void {
   if (item.encrypted_content !== undefined && typeof item.encrypted_content !== 'string') {
     protocol('Response reasoning content is invalid.');
   }
-}
-
-function requireTokenCount(value: unknown, name: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    protocol(`Response usage ${name} is invalid.`);
-  }
-  return value;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

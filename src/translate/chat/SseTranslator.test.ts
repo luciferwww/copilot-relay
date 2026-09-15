@@ -44,7 +44,11 @@ test('Chat SSE translator preserves a tool id across split frames and arguments'
     data({
       ...base,
       choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-      usage: { prompt_tokens: 5, completion_tokens: 7 },
+      usage: {
+        prompt_tokens: 9,
+        prompt_tokens_details: { cached_tokens: 3, cache_write_tokens: 2 },
+        completion_tokens: 7,
+      },
     }),
     data('[DONE]'),
   ].join('');
@@ -57,6 +61,9 @@ test('Chat SSE translator preserves a tool id across split frames and arguments'
   assert.equal(output.some((frame) => frame.includes('"id":"call-123"')), true);
   assert.equal(output.filter((frame) => frame.includes('input_json_delta')).length, 2);
   assert.match(output.at(-2) ?? '', /"stop_reason":"tool_use"/u);
-  assert.match(output.at(-2) ?? '', /"input_tokens":5,"output_tokens":7/u);
+  assert.match(
+    output.at(-2) ?? '',
+    /"input_tokens":4,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":7/u,
+  );
   assert.match(output.at(-1) ?? '', /event: message_stop/u);
 });

@@ -1,5 +1,6 @@
 import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { matchesRequestedModel } from '../shared.js';
+import { mapChatUsage } from '../token-usage.js';
 import {
   SSE_FRAME_MAX_BYTES,
   STREAM_TEXT_MAX_BYTES,
@@ -33,8 +34,7 @@ export class SseTranslator {
   private text = '';
   private nextBlockIndex = 0;
   private finishReason?: string;
-  private inputTokens = 0;
-  private outputTokens = 0;
+  private usage: Readonly<Record<string, number>> = { input_tokens: 0, output_tokens: 0 };
 
   constructor(context: { readonly model: ModelRecord }, writer: SseWriter) {
     this.context = context;
@@ -247,9 +247,7 @@ export class SseTranslator {
   }
 
   private captureUsage(value: unknown): void {
-    const usage = requireRecord(value, 'usage');
-    this.inputTokens = requireTokenCount(usage.prompt_tokens, 'prompt_tokens');
-    this.outputTokens = requireTokenCount(usage.completion_tokens, 'completion_tokens');
+    this.usage = mapChatUsage(value);
   }
 
   private async complete(): Promise<void> {
@@ -273,7 +271,7 @@ export class SseTranslator {
     await this.emit('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: mapStopReason(this.finishReason, this.tools.size > 0), stop_sequence: null },
-      usage: { input_tokens: this.inputTokens, output_tokens: this.outputTokens },
+      usage: this.usage,
     });
     await this.emit('message_stop', { type: 'message_stop' });
     this.terminal = true;
@@ -306,13 +304,6 @@ function parseArguments(value: string): Record<string, unknown> {
   }
   if (!isRecord(parsed)) protocol('Chat tool arguments must be a JSON object.');
   return parsed;
-}
-
-function requireTokenCount(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    protocol(`Chat usage ${label} is invalid.`);
-  }
-  return value;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

@@ -84,3 +84,27 @@ test('Chat request mapper rejects an unassociated tool result', () => {
     }],
   }, { model }), TranslationError);
 });
+
+test('Chat response mapper decomposes prompt cache usage', () => {
+  const response = mapChatResult({
+    id: 'chat-response',
+    model: 'gpt-test',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: { role: 'assistant', content: 'answer' },
+    }],
+    usage: {
+      prompt_tokens: 12,
+      prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 3 },
+      completion_tokens: 2,
+    },
+  }, { model });
+
+  assert.deepEqual(response.message.usage, {
+    input_tokens: 5,
+    cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 4,
+    output_tokens: 2,
+  });
+});

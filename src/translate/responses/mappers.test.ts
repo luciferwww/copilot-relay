@@ -143,6 +143,64 @@ test('Responses response mapper omits opaque output and preserves text', () => {
   assert.equal(mapped.message.stop_reason, 'end_turn');
 });
 
+test('Responses response mapper exposes refusal text and decomposes cache usage', () => {
+  const mapped = mapResponsesResult({
+    id: 'response-id',
+    model: 'gpt-test',
+    status: 'completed',
+    output: [{
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'refusal', refusal: 'I cannot help with that.' }],
+    }],
+    usage: {
+      input_tokens: 12,
+      input_tokens_details: { cached_tokens: 4, cache_write_tokens: 3 },
+      output_tokens: 2,
+    },
+  }, { model });
+
+  assert.deepEqual(mapped.message.content, [{ type: 'text', text: 'I cannot help with that.' }]);
+  assert.equal(mapped.message.stop_reason, 'refusal');
+  assert.deepEqual(mapped.message.usage, {
+    input_tokens: 5,
+    cache_creation_input_tokens: 3,
+    cache_read_input_tokens: 4,
+    output_tokens: 2,
+  });
+});
+
+test('Responses response mapper accepts cached-only usage and rejects inconsistent cache totals', () => {
+  const response = {
+    id: 'response-id',
+    model: 'gpt-test',
+    status: 'completed',
+    output: [],
+    usage: {
+      input_tokens: 8,
+      input_tokens_details: { cached_tokens: 2 },
+      output_tokens: 1,
+    },
+  };
+  const mapped = mapResponsesResult(response, { model });
+  assert.deepEqual(mapped.message.usage, {
+    input_tokens: 6,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 2,
+    output_tokens: 1,
+  });
+
+  assert.throws(() => mapResponsesResult({
+    ...response,
+    usage: {
+      input_tokens: 8,
+      input_tokens_details: { cached_tokens: 5, cache_write_tokens: 4 },
+      output_tokens: 1,
+    },
+  }, { model }), TranslationError);
+});
+
 test('Responses response mapper rejects duplicate function call ids', () => {
   assert.throws(() => mapResponsesResult({
     id: 'response-id',

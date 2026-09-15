@@ -1,6 +1,7 @@
 import { logger } from '../../logger.js';
 import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { matchesRequestedModel } from '../shared.js';
+import { mapChatUsage } from '../token-usage.js';
 import { TranslationError, type MappedMessage } from '../responses/types.js';
 
 /** Maps one bounded Chat Completions response into an Anthropic Message. */
@@ -45,7 +46,7 @@ export function mapChatResult(
   }
   const finishReason = requireNonEmptyString(choice.finish_reason, 'finish reason');
   const stopReason = mapStopReason(finishReason, hasToolCalls);
-  const usage = requireRecord(response.usage, 'usage');
+  const usage = mapChatUsage(response.usage);
   return {
     message: {
       id,
@@ -55,10 +56,7 @@ export function mapChatResult(
       content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: {
-        input_tokens: requireTokenCount(usage.prompt_tokens, 'prompt_tokens'),
-        output_tokens: requireTokenCount(usage.completion_tokens, 'completion_tokens'),
-      },
+      usage,
     },
   };
 }
@@ -83,13 +81,6 @@ function parseArguments(value: string): Record<string, unknown> {
   }
   if (!isRecord(parsed)) protocol('Chat tool arguments must be a JSON object.');
   return parsed;
-}
-
-function requireTokenCount(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    protocol(`Chat usage ${label} is invalid.`);
-  }
-  return value;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

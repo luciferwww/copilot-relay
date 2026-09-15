@@ -302,7 +302,11 @@ Each translation invocation is independent. The output mapper returns no continu
 
 The bounded target JSON must provide a non-empty response id, the requested model or its version-qualified `<requested-model>-YYYY-MM-DD` form, a successful or supported incomplete terminal state, and the output collection required by that protocol. The version-qualified form is accepted only as an upstream response identity; every request invocation and Anthropic response continues to use the exact requested model id.
 
-For Chat, the mapper uses the primary choice and maps assistant text plus function `tool_calls`. For Responses, it maps assistant `output_text` and `function_call` items and ignores reasoning or opaque items with a safe warning. A function call requires a non-empty id (`tool_calls[].id` for Chat or `call_id` for Responses), non-empty name, and arguments that parse as a JSON object.
+For Chat, the mapper uses the primary choice and maps assistant text plus function `tool_calls`. For Responses, it maps assistant `output_text`, `refusal`, and `function_call` items and ignores reasoning or opaque items with a safe warning. A Responses refusal part must have the verified `{type:'refusal', refusal:string}` shape; its refusal string becomes an Anthropic text block without rewriting. A function call requires a non-empty id (`tool_calls[].id` for Chat or `call_id` for Responses), non-empty name, and arguments that parse as a JSON object.
+
+Responses `usage.input_tokens` is an inclusive input total. When `usage.input_tokens_details` contains either recognized cache count, the mapper emits `cache_read_input_tokens` from `cached_tokens`, `cache_creation_input_tokens` from `cache_write_tokens`, and Anthropic `input_tokens` as the inclusive total minus both cache counts. A missing `cache_write_tokens` is zero for the verified older cached-only layout. If no recognized cache count is present, the inclusive total remains Anthropic `input_tokens` and cache fields are omitted. All supplied token counts must be non-negative integers, and cache counts must not sum beyond the inclusive input total; inconsistent usage is an Anthropic 502 rather than guessed accounting.
+
+Chat applies the same rule to its equivalent `prompt_tokens`, `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details.cache_write_tokens` fields. Its `completion_tokens` remains Anthropic `output_tokens`.
 
 The Anthropic response uses the target response id, exact requested model, mapped content blocks, available token usage, and one of:
 
@@ -311,7 +315,7 @@ The Anthropic response uses the target response id, exact requested model, mappe
 | normal stop/completed | `end_turn` |
 | function or tool calls | `tool_use` |
 | token/output limit | `max_tokens` |
-| content filter/refusal | `refusal` when representable, otherwise `end_turn` with a safe warning |
+| content filter/refusal | `refusal` when represented by visible refusal content, otherwise `end_turn` with a safe warning |
 
 Missing required structure, an unrelated model identity, invalid function arguments, or a failed/canceled target response is an Anthropic 502. Unknown optional output remains client-invisible and is not retained.
 
@@ -327,14 +331,14 @@ Chat accepts its normal `data: [DONE]` terminator. Responses requires a valid te
 
 The translator emits one `message_start`, ordered content block events, one terminal `message_delta`, and one `message_stop` on success.
 
-- Text deltas open one Anthropic text block and stream `text_delta` values.
+- Text and refusal deltas each open an Anthropic text block and stream `text_delta` values. Responses refusal parts use the verified `response.refusal.delta` and `response.refusal.done` events; the done value and completed refusal part must exactly match accumulated deltas.
 - Chat function fragments are grouped by `tool_calls[].index`; the upstream id and name are retained and argument fragments become `input_json_delta`.
 - Responses function fragments are grouped by output index; `call_id` becomes the Anthropic tool id and argument fragments become `input_json_delta`.
 - A function block closes only after its complete arguments parse as a JSON object.
-- Usage and terminal reason come from the target's terminal chunk or event when supplied; missing optional usage is represented as zero rather than inferred.
+- Usage and terminal reason come from the target's terminal chunk or event when supplied; missing optional usage is represented as zero rather than inferred. Responses terminal usage applies the same inclusive-total cache decomposition as non-streaming output.
 - Responses reasoning and opaque items emit no Anthropic content and are not retained.
 
-The request-local state is bounded by `STREAM_TEXT_MAX_BYTES` and `TOOL_ARGUMENTS_MAX_BYTES` and is discarded at the end of the request. Conflicting indexes or ids, required deltas before a start, malformed final arguments, duplicate terminal state, and premature EOF are protocol failures. Unknown auxiliary events warn and continue only when all visible translated blocks can still close coherently.
+The request-local state is bounded by `STREAM_TEXT_MAX_BYTES` and `TOOL_ARGUMENTS_MAX_BYTES` and is discarded at the end of the request. Conflicting indexes or ids, required deltas before a start, mismatched refusal lifecycle values, malformed final arguments, duplicate terminal state, and premature EOF are protocol failures. Unknown auxiliary events warn and continue only when all visible translated blocks can still close coherently.
 
 Every downstream frame is `event: <type>\ndata: <single-line JSON>\n\n`. A mid-stream failure follows §11.3 and never emits a success terminator.
 
