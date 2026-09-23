@@ -48,9 +48,16 @@ export interface ResponsesReasoningItem {
   status?: string;
 }
 
+export interface ResponsesOpaqueItem {
+  readonly [key: string]: unknown;
+  readonly type: string;
+  readonly id?: string;
+  readonly status?: string;
+}
+
 export interface CompletedContinuationItem {
   outputIndex: number;
-  item: ResponsesFunctionCallItem | ResponsesReasoningItem;
+  item: ResponsesFunctionCallItem | ResponsesReasoningItem | ResponsesOpaqueItem;
 }
 
 export interface ContinuationCall {
@@ -66,7 +73,6 @@ export interface ContinuationGroup {
   createdAt: number;
   lastAccessedAt: number;
   expiresAt: number;
-  absoluteExpiresAt: number;
   items: readonly CompletedContinuationItem[];
   calls: ReadonlyMap<string, ContinuationCall>;
   byteSize: number;

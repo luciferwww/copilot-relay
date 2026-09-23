@@ -1,11 +1,12 @@
 import http from 'node:http';
-import type { AppConfig } from './config.js';
+import { CONTINUATION_DIR, type AppConfig } from './config.js';
 import { isLoopbackHost, requireRemoteAccessOptIn } from './bind-policy.js';
 import { AuthManager, AuthManagerError } from './auth/AuthManager.js';
 import { ModelCatalog, ModelCatalogError } from './models/ModelCatalog.js';
 import { planMessagesRoute, type MessagesRoutePlan } from './routing/messages-route.js';
 import { CopilotTransport, type InvocationContext, type InvocationPlan } from './upstream/CopilotTransport.js';
 import { ContinuationRegistry } from './translate/responses/ContinuationRegistry.js';
+import { ContinuationStore } from './translate/responses/ContinuationStore.js';
 import { mapMessagesRequest } from './translate/responses/request-mapper.js';
 import { mapResponsesResult } from './translate/responses/response-mapper.js';
 import { SseTranslator } from './translate/responses/SseTranslator.js';
@@ -40,6 +41,7 @@ export interface HttpRuntime {
   readonly transport: CopilotTransport;
   readonly catalog: ModelCatalog;
   readonly registry: ContinuationRegistry;
+  close?(): void;
 }
 
 export interface HttpServerOptions {
@@ -80,6 +82,12 @@ export async function startHttpServer(
     logger.warn('Remote access enabled; the relay listener has no inbound authentication.');
   }
   const runtime = options.runtime ?? createRuntime(cfg);
+  let runtimeClosed = false;
+  const closeRuntime = (): void => {
+    if (runtimeClosed) return;
+    runtimeClosed = true;
+    runtime.close?.();
+  };
   const server = http.createServer((req, res) => {
     handleRequest(req, res, runtime).catch(() => {
       if (!res.headersSent && !res.destroyed) {
@@ -93,17 +101,26 @@ export async function startHttpServer(
       }
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(cfg.port, cfg.host, resolve);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(cfg.port, cfg.host, resolve);
+    });
+  } catch (error) {
+    closeRuntime();
+    throw error;
+  }
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : cfg.port;
   const displayHost = cfg.host.includes(':') ? `[${cfg.host}]` : cfg.host;
   logger.info(`copilot-relay listening on http://${displayHost}:${port}`);
   return {
     port,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => {
+      closeRuntime();
+      if (error) reject(error);
+      else resolve();
+    })),
   };
 }
 
@@ -646,14 +663,28 @@ function failure(status: number, type: SafeFailure['type'], message: string): Sa
 function isSafeFailure(value: unknown): value is SafeFailure {
   return (
     isRecord(value) &&
-    typeof value.status === 'number' &&
-    typeof value.type === 'string' &&
-    typeof value.message === 'string'
+    Number.isInteger(value.status) &&
+    (value.status as number) >= 400 &&
+    (value.status as number) <= 599 &&
+    isFailureType(value.type) &&
+    typeof value.message === 'string' &&
+    value.message.trim().length > 0 &&
+    (value.code === undefined || typeof value.code === 'string')
+  );
+}
+
+function isFailureType(value: unknown): value is SafeFailure['type'] {
+  return (
+    value === 'invalid_request_error' ||
+    value === 'authentication_error' ||
+    value === 'permission_error' ||
+    value === 'rate_limit_error' ||
+    value === 'api_error'
   );
 }
 
 function requireModelId(body: Record<string, unknown>): string {
-  if (typeof body.model !== 'string' || body.model.length === 0) {
+  if (typeof body.model !== 'string' || body.model.trim().length === 0) {
     throw failure(400, 'invalid_request_error', 'model must be a non-empty string.');
   }
   return body.model;
@@ -846,9 +877,18 @@ function isRequestDiagnosticCode(value: string | undefined): value is RequestDia
 function createRuntime(cfg: AppConfig): HttpRuntime {
   const auth = new AuthManager(cfg);
   const transport = new CopilotTransport(cfg, auth);
+  const store = new ContinuationStore(CONTINUATION_DIR);
+  let registry: ContinuationRegistry;
+  try {
+    registry = new ContinuationRegistry({ store });
+  } catch (error) {
+    store.close();
+    throw error;
+  }
   return {
     transport,
     catalog: new ModelCatalog(transport),
-    registry: new ContinuationRegistry(),
+    registry,
+    close: () => registry.close(),
   };
 }

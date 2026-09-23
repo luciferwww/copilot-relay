@@ -18,5 +18,6 @@ The native route is a bounded thin passthrough using the existing HTTP request o
 
 - Native Responses and translated Messages may share upstream `/responses` while retaining separate client protocol paths.
 - Successful native request and response semantics remain passthrough; translation-only continuation behavior remains isolated.
+- Only strict boolean `stream: true` selects SSE transport. Other values remain byte-preserved and upstream-owned under the thin-passthrough contract.
 - A `/responses` alias and WebSocket transport remain outside this decision. PR #1 also introduced configurable host binding; the project later adopted that capability under the global bind policy in `requirement.md`, `design.md`, and `spec.md`, independently of the native Responses route.
 - The authoritative requirements, architecture, protocol behavior, limits, errors, retries, and tests are maintained in [requirement.md](./requirement.md), [design.md](./design.md), and [spec.md](./spec.md). This record preserves provenance and rationale rather than duplicating those contracts.
