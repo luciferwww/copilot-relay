@@ -1,23 +1,26 @@
 # copilot-relay — Specification (v0.2)
 
-> Status: approved 2026-08-24; amended 2026-08-26; production implementation in progress. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
+> Status: approved 2026-08-24; amended 2026-09-15; production implementation pending migration. This document is the implementation contract for the approved [requirement.md](./requirement.md) and [design.md](./design.md). When they conflict, `requirement.md` wins.
+
+> Decision record: [Stateless Messages Translation](./stateless-messages-translation-decision.md) governs translated Messages routing and tool identity.
 
 > Compatibility contract: [Protocol Compatibility](./protocol-compatibility-principle.md) governs unknown and additive protocol data throughout this specification.
 
 ## 1. Scope and invariants
 
-v0.2 preserves the v0.1 CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, and loopback-only server. It adds inbound Anthropic Messages to Copilot HTTP `/responses` translation and native OpenAI Responses passthrough.
+The current contract preserves the CLI, OpenAI Chat Completions passthrough, native Anthropic Messages passthrough, models passthrough, device login, loopback-only server, and native OpenAI Responses passthrough. It routes inbound Anthropic Messages to native Messages, stateless Chat Completions translation, or stateless best-effort Responses translation.
 
 The following invariants are mandatory:
 
 - The exact inbound model id is used for every model invocation and for catalog lookup on capability-routed requests. The relay never substitutes a model.
 - When the relay makes a capability decision, live Copilot `/models` metadata is the only runtime authority. Captures such as `1.json` are fixtures only; native passthrough routes do not make capability decisions.
-- Endpoint priority for `POST /v1/messages` is exact `/v1/messages`, then exact `/responses`. `ws:/responses` is not HTTP `/responses`.
+- Endpoint priority for `POST /v1/messages` is exact `/v1/messages`, exact `/chat/completions`, then exact HTTP `/responses`. `ws:/responses` is not HTTP `/responses`.
 - Every translated request is completely validated before the first model invocation.
 - Translated Responses requests always set `store: false` and never send `previous_response_id`; native Responses requests preserve those client fields.
+- Translation never allocates a replacement function-call id and never retains state across HTTP requests.
 - No retry or re-plan occurs after the first downstream response byte.
 - Raw upstream bodies, headers, errors, credentials, image data, and credential-derived substrings never reach logs, CLI output, persisted diagnostics, or client errors.
-- Additive fields, variants, output items, and auxiliary events are mapped, passed through, or omitted with a safe warning whenever continuation remains possible. Required identity, association, framing, resource, and translated-state invariants fail closed.
+- Additive fields, variants, output items, and auxiliary events are mapped, passed through, or omitted with a safe warning whenever a useful target exchange remains possible. Required identity, tool association, framing, resource, and translated-state invariants fail closed.
 
 ## 2. Fixed limits and deadlines
 
@@ -26,7 +29,7 @@ These are code constants, not v0.2 configuration fields.
 | Constant | Value | Applies to |
 |---|---:|---|
 | `REQUEST_BODY_MAX_BYTES` | 8 MiB | Any inbound POST body |
-| `NON_STREAM_RESPONSE_MAX_BYTES` | 8 MiB | Translated non-streaming `/responses` JSON |
+| `NON_STREAM_RESPONSE_MAX_BYTES` | 8 MiB | Translated non-streaming Chat or Responses JSON |
 | `ERROR_BODY_MAX_BYTES` | 64 KiB | Upstream non-2xx body used for allowlisted classification |
 | `SSE_FRAME_MAX_BYTES` | 1 MiB | One incomplete or complete upstream SSE frame |
 | `STREAM_TEXT_MAX_BYTES` | 1 MiB | Reconstructed UTF-8 text for one streaming output item |
@@ -39,10 +42,6 @@ These are code constants, not v0.2 configuration fields.
 | `MODEL_CATALOG_TIMEOUT_MS` | 15 seconds | One internal catalog refresh |
 | `EXTERNAL_MODELS_TIMEOUT_MS` | 30 seconds | Client-facing `/v1/models` passthrough |
 | `MODEL_INVOCATION_TIMEOUT_MS` | 10 minutes | One generation request including retries |
-| `CONTINUATION_TTL_MS` | 7 days | Continuation group idle lifetime, renewed by successful lookup; there is no absolute lifetime |
-| `CONTINUATION_MAX_GROUPS` | 256 | Published groups per process |
-| `CONTINUATION_GROUP_MAX_BYTES` | 2 MiB | Serialized items in one group |
-| `CONTINUATION_TOTAL_MAX_BYTES` | 32 MiB | Serialized items across all groups |
 
 MiB means $1024^2$ bytes. Byte limits are enforced while reading or accumulating, before an additional chunk would cross the limit. JSON character counts are not substitutes for UTF-8 byte counts.
 
@@ -55,9 +54,8 @@ MiB means $1024^2$ bytes. Byte limits are enforced while reading or accumulating
 | `~/.copilot-relay/config.json` | User configuration |
 | `~/.copilot-relay/auth.json` | Authentication state |
 | `~/.copilot-relay/server.pid` | Foreground server PID |
-| `~/.copilot-relay/continuations/` | Versioned plaintext continuation group records |
 
-On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`; the continuation directory uses mode `0700`, and its record and temporary files use mode `0600`. Windows relies on the user-profile ACL.
+On Windows, `~` is `%USERPROFILE%`. On Unix-like systems, `auth.json` is written with mode `0600`. Windows relies on the user-profile ACL.
 
 ### 3.2 Config schema
 
@@ -130,14 +128,14 @@ The HTTP server exposes:
 | `GET /v1/models` | Independent request-owned byte-for-byte upstream passthrough |
 | `POST /v1/chat/completions` and `/chat/completions` | Existing Chat Completions passthrough |
 | `POST /v1/responses` | Bounded thin passthrough to upstream `/responses` |
-| `POST /v1/messages` | Capability-routed native passthrough or Responses translation |
+| `POST /v1/messages` | Capability-routed native, Chat, or Responses path |
 | Other | `404` local OpenAI-shaped error |
 
 Successful native `/v1/responses`, native `/v1/messages`, Chat Completions, and external `/v1/models` bodies and streams remain byte-for-byte passthrough. Non-2xx bodies are never byte-for-byte passthrough. The external models route neither reads nor publishes `ModelCatalog` state and may run concurrently with a separate internal refresh.
 
 `127.0.0.0/8`, `::1`, its full IPv6 spelling, and `localhost` are loopback hosts. Every other host is remote for policy purposes, including wildcard addresses, interface addresses, and non-local DNS names. `startHttpServer` rejects a remote host before creating a listener unless its invocation receives `allowRemoteAccess: true`; the CLI supplies that value only from the current `--allow-remote-access` flag. A remote start emits a warning that the listener has no inbound authentication. Invalid configured hosts fall back to the default; an invalid explicit `--host` fails startup.
 
-Native Messages passthrough forwards inbound `anthropic-version` (default `2023-06-01`) and optional `anthropic-beta`. Translated and native `/responses` calls do not forward Anthropic headers; they send Bearer authorization, JSON content type, configured Copilot client headers, `Copilot-Integration-Id`, `Openai-Intent: conversation-panel`, and `Accept: application/json` or `text/event-stream` according to `stream`.
+Native Messages passthrough forwards inbound `anthropic-version` (default `2023-06-01`) and optional `anthropic-beta`. Translated Chat and Responses calls do not forward Anthropic headers; they send Bearer authorization, JSON content type, configured Copilot client headers, `Copilot-Integration-Id`, `Openai-Intent: conversation-panel`, and `Accept: application/json` or `text/event-stream` according to `stream`.
 
 ### 4.1 Inbound POST body contract
 
@@ -223,11 +221,12 @@ Records with a valid id but no `supported_endpoints` field are retained in a gen
 For the exact requested model:
 
 1. Exact `/v1/messages` produces `messages-passthrough`.
-2. Otherwise exact `/responses` plus translator availability produces `responses-translation`.
-3. Otherwise a well-formed model produces Anthropic 400 naming only the safe model id and advertised endpoint strings.
-4. Missing/malformed required metadata produces Anthropic 502.
+2. Otherwise exact `/chat/completions` produces `chat-translation`.
+3. Otherwise exact `/responses` produces `responses-translation`.
+4. Otherwise a well-formed model produces Anthropic 400 naming only the safe model id and advertised endpoint strings.
+5. Missing/malformed required metadata produces Anthropic 502.
 
-Feature support is the intersection of explicit metadata and this spec. Tools require `supports.tool_calls === true`; parallel calls require `supports.parallel_tool_calls === true`; streaming requires `supports.streaming === true`; images require `supports.vision === true` plus the vision limits in §7.4.
+Feature support is the intersection of explicit metadata and this spec. Tools require `supports.tool_calls === true`; parallel calls require `supports.parallel_tool_calls === true`; streaming requires `supports.streaming === true`.
 
 ### 6.4 Native Responses route
 
@@ -235,220 +234,113 @@ Exact inbound `POST /v1/responses` requires a string `model` containing at least
 
 The request uses the original admitted body bytes and query string. `Accept` is `text/event-stream` only for `stream === true`, otherwise `application/json`. A present non-boolean `stream` remains byte-preserved and upstream-owned rather than causing local schema rejection. Successful upstream bytes use OpenAI passthrough. Non-2xx bodies follow §11.1: read at most `ERROR_BODY_MAX_BYTES`, inspect only allowlisted machine fields, and return a locally constructed safe error.
 
-## 7. Tolerant Messages request mapping
+## 7. Stateless Messages request mapping
 
-The tables define verified mappings, not a closed input schema. Additive fields are omitted with a warning, target-shaped unknown tools may pass through, and unknown optional components are skipped. Return Anthropic `400 invalid_request_error` only when required target data is missing/invalid or continuation cannot remain coherent.
+The tables define the implemented baseline, not a closed input schema. Additive fields are omitted with a safe warning, target-shaped optional structures may pass through when no reinterpretation is needed, and unsupported optional content is skipped. Return Anthropic `400 invalid_request_error` when required target data is missing or invalid, no usable input remains, or tool association is ambiguous.
 
 ### 7.1 Top-level fields
 
-| Anthropic field | Responses mapping |
-|---|---|
-| `model` | Required non-empty string; copied exactly |
-| `messages` | Required non-empty array; map by §7.2 |
-| `max_tokens` | Required integer; `max_output_tokens`; must be at least 16 and no greater than metadata `limits.max_output_tokens` |
-| `system` | String or text-block array joined with `\n\n`; `instructions` |
-| `stream` | Boolean; copied; default `false` |
-| `tools` | Absent or empty array means no tools; non-empty array maps by §7.3 and requires tool capability |
-| `tool_choice` | Map by §7.3 |
-| `temperature` | Copy to Responses; upstream validates its value |
-| `top_p` | Copy to Responses; upstream validates its value |
-| `top_k` | Omit with warning because Responses has no equivalent |
-| `stop_sequences` | Omit with warning because Responses has no equivalent |
-| `metadata` | Copy `user_id:string`, omit additive keys, and omit the optional object if `user_id` cannot be mapped |
-| `output_config` | Map an advertised non-empty `effort:string`; otherwise omit this optional control with warning |
+| Anthropic field | Chat mapping | Responses mapping |
+|---|---|---|
+| `model` | Required non-empty string; copied exactly | Same |
+| `messages` | Required non-empty array; map by §7.2 | Same |
+| `max_tokens` | `max_completion_tokens` | `max_output_tokens` |
+| `system` | Prepend one system message | `instructions` |
+| `stream` | Boolean; copied; default `false` | Same |
+| `tools` | Function tools by §7.3 | Flat function tools by §7.3 |
+| `tool_choice` | Map by §7.3 | Map by §7.3 |
+| `temperature`, `top_p` | Copy for upstream validation | Same |
+| Other optional fields | Pass through only with a verified target shape; otherwise warn and omit | Same |
 
-Every Responses request also sets `store:false`. `previous_response_id` is never sent. An absent or untranslatable `output_config` emits no `reasoning` field. Additive keys, malformed effort values, unavailable effort metadata, and unadvertised efforts warn and omit this optional control.
+Every translated Responses request sets `store:false` and does not send `previous_response_id`. The relay does not send a reasoning control in the baseline.
 
-### 7.2 Message content
+### 7.2 Message content and tool history
 
-| Anthropic input | Responses input |
-|---|---|
-| User string or `text` block | User `input_text`; a block may additionally carry exact `cache_control:{type:'ephemeral'}`, which is validated and omitted upstream |
-| Assistant string or `text` block | Assistant `output_text`; the same exact ephemeral cache hint is validated and omitted upstream |
-| System string or `text` block | System `input_text`, retained at the same message position; string content must be non-empty, while array content requires at least one text block; the same exact ephemeral cache hint is validated and omitted upstream |
-| Assistant `tool_use` emitted by this relay | Resolve continuation; validate the historical input projection below; replay authoritative completed item, not client-provided `input`; the same exact ephemeral cache hint is validated and omitted upstream |
-| User `tool_result` with string/text content | `function_call_output` using stored `call_id`; boolean `is_error` and the same exact ephemeral cache hint are validated and omitted upstream; output is concatenated text |
-| User base64 `image` block | `input_image` with data URL, §7.4 |
+| Anthropic input | Chat mapping | Responses mapping |
+|---|---|---|
+| User text | User message content | User `input_text` |
+| Assistant text | Assistant message content | Assistant `output_text` |
+| System-role text | System message in the same history position | System `input_text` in the same position |
+| Assistant `tool_use` | Assistant `tool_calls[]` using the same id | `function_call` using the same `call_id` |
+| User text `tool_result` | `role:'tool'` using the same `tool_call_id` | `function_call_output` using the same `call_id` |
 
-Top-level `system` maps to Responses `instructions`, while a system-role message remains in its original input position. Unknown non-text content is skipped with warning. `tool_result.is_error` is omitted because Responses has no equivalent while result text is preserved. Cache-control hints and extensions are omitted with warning. PDF/document, thinking/redacted-thinking, image tool results, URL images, and other unknown blocks are skipped when other translatable content remains; a request with no translatable content fails because no target input can be constructed.
+String content and adjacent text blocks are joined without changing their text. `tool_use.input` is JSON-serialized and must be an object. A tool result preserves its text; `is_error` and cache hints are omitted without adding markers to the content.
 
-The mapper scans the complete history in message and content-block order. A relay-issued assistant `tool_use` opens its resolved continuation group; parallel tool uses from the same response belong to that one group. The corresponding later user `tool_result` blocks close it. Once closed, that historical group no longer participates in validation of a later group, so one request may contain any number of ordered, closed groups such as `G1` followed by `G2`. At most one group may be open at a scan position, and no group may be reopened or appear out of order.
+The mapper scans the complete submitted history in order. Each non-empty tool id may identify one historical call and one matching result. A result must follow its call, and parallel calls remain distinct by id. Missing, duplicate, conflicting, or reused out-of-order ids; a result without a preceding call; invalid tool names; and non-object inputs fail before transport. The mapper never associates tools by name, text, or position alone.
 
-For each represented group, every tool id must resolve to that unexpired group, match the exact requested model and historical assistant block, occur once in the request, and have exactly one result for every function call in the group. The historical tool name must equal the authoritative name. Historical input keys must be a subset of the authoritative top-level keys; every retained value must be JSON-deep-equal, and every omitted authoritative value must be exactly `false`. Added keys, changed values, nested normalization, and omission of any other value fail before transport. This narrow projection accepts Claude Code's removal of explicit false defaults without treating client input as authoritative. The mapper inserts the group's original completed reasoning and function-call items once at its assistant position, then inserts the matching `function_call_output` items at the user result position. Missing results, a result before its tool use, mixed groups in one parallel call set, duplicated ids, cross-model references, or an unclosed group at end of history fail before transport with Anthropic 400.
+For Responses, the reconstructed `function_call` is explicitly best-effort and is not represented as the original complete output sequence. Opaque reasoning items, encrypted content, item ids other than `call_id`, thinking blocks, and hosted-tool state are omitted. An upstream rejection caused by missing opaque state is terminal.
 
-### 7.3 Tools and tool choice
+Images, documents, non-text tool results, thinking blocks, hosted tools, reasoning controls, `top_k`, non-empty `stop_sequences`, and other unimplemented features are outside the baseline. They are warned and omitted when usable baseline content remains; otherwise the request fails locally.
 
-An absent or empty Anthropic tools array produces no Responses tool fields. Each custom entry `{type?:'custom', name, description?, input_schema}` maps to Responses `{type:'function', name, description?, parameters:input_schema}`; a malformed custom entry is omitted while additive fields are omitted with warning. Every string discriminator beginning `web_search_` belongs to one version-tolerant tool family and maps to Responses `{type:'web_search'}`. A valid non-empty string-array `allowed_domains` maps to `filters.allowed_domains`; an untranslatable value is omitted with warning. The Anthropic hosted-tool name is used only to resolve `tool_choice` and is not required to equal `web_search`. Other tool types pass through unchanged with a fixed-context warning so Copilot can make the final support decision.
+### 7.3 Function tools and tool choice
 
-| Anthropic `tool_choice.type` | Responses `tool_choice` |
+Each valid Anthropic client tool `{name, description?, input_schema}` maps to:
+
+- Chat: `{type:'function', function:{name, description?, parameters:input_schema}}`;
+- Responses: `{type:'function', name, description?, parameters:input_schema}`.
+
+Malformed tool definitions are omitted with a warning unless doing so leaves a tool choice that cannot be satisfied.
+
+| Anthropic `tool_choice.type` | Target `tool_choice` |
 |---|---|
 | absent or `auto` | `auto` |
 | `any` | `required` |
-| `tool` with an existing `name` | `{type:'function', name}` |
+| `tool` with a valid declared name | Target's named-function form |
 | `none` | `none` |
 
-`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false`; `false`, invalid, or absent maps according to live parallel support, with invalid values warned and ignored. Unknown tool-choice variants pass through. A named choice that cannot be resolved unambiguously falls back to `auto` with warning.
+`disable_parallel_tool_use:true` maps to `parallel_tool_calls:false` where supported. Invalid or unavailable optional controls warn and are omitted. Hosted and unknown tool types are not converted into client function tools.
 
-### 7.4 Base64 image
+## 8. Translated output boundary
 
-Exactly zero or one image is accepted, only in a user message with source `{type:'base64', media_type, data}`.
+Buffered and streaming output mappers expose only Anthropic text and standard client `tool_use` blocks. Chat `tool_calls[].id` and Responses `function_call.call_id` become the Anthropic tool id unchanged. Function arguments must be valid JSON objects; the mapper does not substitute `{}` for malformed arguments.
 
-- `media_type` must appear in `capabilities.limits.vision.supported_media_types` and must not be `application/pdf`.
-- `data` must be a non-empty canonical base64 string; whitespace, URL-safe alphabet, and padding errors are rejected without decoding the image.
-- The decoded-size value is computed as $3\lfloor n/4\rfloor-p$, where $n$ is encoded length and $p$ is terminal padding count. It must not exceed `limits.vision.max_prompt_image_size`.
-- `supports.vision` must be `true`; `limits.vision.max_prompt_images` must be numeric and at least 1.
-- The upstream block is `{type:'input_image', image_url:'data:<media_type>;base64,<data>', detail:'auto'}`.
+Usage and terminal reasons map only where the target response supplies a verified equivalent. Unknown optional content and opaque Responses items warn and remain client-invisible. Opaque items are not retained for a later request.
 
-The relay does not fetch, decode, transcode, persist, or log image content. Any URL source is rejected locally.
+Each translation invocation is independent. The output mapper returns no continuation token, stage, registry handle, or persistence side effect.
 
-## 8. Continuation registry
+## 9. Non-streaming translated output
 
-### 8.1 Data model
+The bounded target JSON must provide a non-empty response id, the requested model or its version-qualified `<requested-model>-YYYY-MM-DD` form, a successful or supported incomplete terminal state, and the output collection required by that protocol. The version-qualified form is accepted only as an upstream response identity; every request invocation and Anthropic response continues to use the exact requested model id.
 
-```typescript
-interface CompletedContinuationItem {
-  outputIndex: number;
-  item: ResponsesFunctionCallItem | ResponsesReasoningItem;
-}
+For Chat, the mapper uses the primary choice and maps assistant text plus function `tool_calls`. For Responses, it maps assistant `output_text`, `refusal`, and `function_call` items and ignores reasoning or opaque items with a safe warning. A Responses refusal part must have the verified `{type:'refusal', refusal:string}` shape; its refusal string becomes an Anthropic text block without rewriting. A function call requires a non-empty id (`tool_calls[].id` for Chat or `call_id` for Responses), non-empty name, and arguments that parse as a JSON object.
 
-interface ContinuationGroup {
-  groupId: string;
-  modelId: string;
-  createdAt: number;
-  lastAccessedAt: number;
-  expiresAt: number;
-  items: readonly CompletedContinuationItem[];
-  calls: ReadonlyMap<string, { callId: string; outputIndex: number }>;
-  byteSize: number;
-}
-```
+Responses `usage.input_tokens` is an inclusive input total. When `usage.input_tokens_details` contains either recognized cache count, the mapper emits `cache_read_input_tokens` from `cached_tokens`, `cache_creation_input_tokens` from `cache_write_tokens`, and Anthropic `input_tokens` as the inclusive total minus both cache counts. A missing `cache_write_tokens` is zero for the verified older cached-only layout. If no recognized cache count is present, the inclusive total remains Anthropic `input_tokens` and cache fields are omitted. All supplied token counts must be non-negative integers, and cache counts must not sum beyond the inclusive input total; inconsistent usage is an Anthropic 502 rather than guessed accounting.
 
-Map keys are relay-generated cryptographically random Anthropic `tool_use.id` values. Group and tool ids are opaque and never derived from model text or tool names. Published groups are immutable and reusable until eviction. A successful lookup atomically updates `lastAccessedAt` and renews the idle deadline by `CONTINUATION_TTL_MS` without changing the group identity. Invalid, incomplete, model-mismatched, or otherwise failed lookups do not renew it. There is no absolute lifetime: a group remains available while successfully used within each seven-day window, subject to capacity-driven LRU eviction.
+Chat applies the same rule to its equivalent `prompt_tokens`, `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details.cache_write_tokens` fields. Its `completion_tokens` remains Anthropic `output_tokens`.
 
-### 8.2 Staging and atomic publication
+The Anthropic response uses the target response id, exact requested model, mapped content blocks, available token usage, and one of:
 
-Each invocation owns an unpublished stage. A completed function-call item allocates its external tool id and adds both to the stage. A completed reasoning item, including observed `encrypted_content`, is retained exactly when present. Added/in-progress items and deltas are never authoritative continuation data.
+| Target terminal reason | Anthropic `stop_reason` |
+|---|---|
+| normal stop/completed | `end_turn` |
+| function or tool calls | `tool_use` |
+| token/output limit | `max_tokens` |
+| content filter/refusal | `refusal` when represented by visible refusal content, otherwise `end_turn` with a safe warning |
 
-`publish(stage)` runs synchronously without `await`:
+Missing required structure, an unrelated model identity, invalid function arguments, or a failed/canceled target response is an Anthropic 502. Unknown optional output remains client-invisible and is not retained.
 
-1. Build a temporary live view and expiry-removal plan without mutating the registry.
-2. Against that live view, reject duplicate ids or malformed/empty staged calls.
-3. Compute the new group byte size from UTF-8 JSON serialization. If it exceeds `CONTINUATION_GROUP_MAX_BYTES`, throw without mutation.
-4. In the temporary eviction plan, order live existing groups by `lastAccessedAt`, then `createdAt`, then `groupId`, and select the least recently used groups until adding the new group would satisfy both `CONTINUATION_MAX_GROUPS` and `CONTINUATION_TOTAL_MAX_BYTES`.
-5. Atomically install the new group's versioned record. A write failure leaves the in-memory registry unchanged and returns a translation 502 before success is committed to the client.
-6. In one synchronous critical section, remove every expiry- or capacity-planned group and its id mappings, then insert the complete immutable group and all new id mappings. No observer may see an intermediate state.
-7. Remove expired and evicted records. A failed cleanup is reported without identifiers or content; startup validation and LRU enforcement keep any leftover record unavailable when the store is reopened.
-
-For non-streaming output, publish occurs after complete validation and immediately before writing the Anthropic response. For streaming, it occurs after all tool blocks have been written and immediately before terminal `message_delta`. Failure or disconnect before publication discards the stage; disconnect after publication does not roll it back.
-
-Group-count and total-byte pressure therefore evict old groups rather than reject the new one; only an oversized new group, malformed stage, id collision, or required persistence failure causes publication failure. Unavailable ids return 400. Atomically published, unexpired groups are recovered after relay process replacement because the client-visible tool id alone does not contain the opaque upstream call state required for replay.
-
-The count and byte limits are fixed for this persistence phase and have no user-facing configuration. Each publication or startup-recovery plan that performs capacity-driven LRU eviction emits one warning, not one warning per removed group. The warning reports whether group count, aggregate bytes, or both triggered eviction, plus evicted-group count, aggregate group and byte totals before and after eviction, and the oldest evicted idle age. It must not contain group ids, tool ids, record names, model names, tool input, replay items, or other continuation content. Idle-TTL cleanup is expected lifecycle behavior and does not emit this warning.
-
-### 8.3 Persistent continuation contract
-
-The released v0.2 registry was process-local. Its restart failure was observable because an Anthropic continuation request contains the relay-issued `tool_use.id` but not the complete Responses replay group. In particular, the upstream `call_id`, authoritative completed function-call item, and model-dependent reasoning or encrypted reasoning items cannot be reconstructed safely from normalized Anthropic history. The persistent store preserves that authoritative group across process replacement; unknown, expired, or invalid ids remain a 400 rather than triggering heuristic reconstruction.
-
-The implementation preserves finite statelessness across relay process replacement without changing the wire mapping. It:
-
-- persist only atomically published groups and atomically remove expired or evicted groups;
-- use one closed, versioned plaintext JSON record per group, named `<groupId>.json`, where `groupId` is the existing random UUID;
-- protect the continuation directory and files with the OS user boundary: Unix modes `0700` and `0600`, and the user-profile ACL on Windows;
-- retain the existing per-group, total-byte, group-count, and model-match bounds, with a renewable 7-day idle TTL and no absolute lifetime;
-- emit safe aggregate warnings for capacity-driven LRU eviction without logging continuation ids or content;
-- validate filename/payload agreement, schema, version, byte counts, ids, timestamps, and model association before inserting any recovered group into the live index;
-- fail closed and delete or quarantine malformed, incompatible, expired, or oversized records without logging their names or contents;
-- never persist client message history beyond the authoritative Responses items and call metadata required for replay;
-- uses flushed temporary files and same-directory atomic rename for record replacement, startup recovery before listening, and an exclusive owner record that blocks a second live relay process; authentication commands do not mutate continuation records;
-- proves with restart tests that an unexpired published tool continuation succeeds after process replacement and that expired or invalid state remains unavailable.
-
-## 9. Non-streaming Responses mapping
-
-The bounded JSON must have matching `model`, a string response `id`, an output array, numeric non-negative `usage.input_tokens` and `usage.output_tokens`, and either:
-
-- `status:'completed'`; or
-- `status:'incomplete'` with `incomplete_details.reason:'max_output_tokens'` and no function-call output item.
-
-Translated output items are:
-
-- `message` with assistant `content` containing only `output_text`; each becomes an Anthropic `text` block;
-- `function_call` with string `call_id`, `name`, and JSON-object `arguments`; each becomes `tool_use` with the staged external id;
-- `reasoning`, retained only for continuation and never emitted as Anthropic thinking;
-- any other completed item, kept opaque only when a function continuation requires exact replay and otherwise client-invisible with warning.
-
-Unknown types and message content variants warn and are ignored. Unknown incomplete reasons degrade to Anthropic `max_tokens`. Mismatched model, malformed function arguments, non-object function arguments, failed/canceled status, missing usage, or any incomplete response containing a function call remain upstream protocol failures (502). An incomplete response never publishes continuation state or returns a successful Anthropic `tool_use` response.
-
-The Anthropic Message is:
-
-```json
-{
-  "id": "<upstream response id>",
-  "type": "message",
-  "role": "assistant",
-  "model": "<exact requested model>",
-  "content": [],
-  "stop_reason": "end_turn | tool_use | max_tokens",
-  "stop_sequence": null,
-  "usage": {"input_tokens": 0, "output_tokens": 0}
-}
-```
-
-Actual content and token counts replace placeholders. A completed response with function calls maps to `tool_use`; an admitted incomplete text-only response maps to `max_tokens`; otherwise completion maps to `end_turn`.
-
-## 10. Streaming Responses mapping
+## 10. Streaming translated output
 
 ### 10.1 SSE transport parser
 
-The parser uses streaming UTF-8 decoding, accepts CRLF or LF, joins multiple `data:` lines with LF, ignores comment lines and the transport fields `id` and `retry`, and uses `event:` only to cross-check the JSON `type` when present. Malformed UTF-8, JSON, oversized frames, mismatched event type, or EOF with an incomplete frame is a 502 stream protocol error.
+The parser uses streaming UTF-8 decoding, accepts CRLF or LF, joins multiple `data:` lines with LF, ignores comments and unrelated transport fields, and enforces `SSE_FRAME_MAX_BYTES`. Malformed UTF-8 or JSON, an oversized frame, a conflicting event type, or EOF with an incomplete translated block is a 502 stream error.
 
-Copilot FR9 streams contained no `[DONE]`. `[DONE]` before a valid terminal event is an error; after a terminal event no more frame is accepted.
+Chat accepts its normal `data: [DONE]` terminator. Responses requires a valid terminal response event; an early `[DONE]` is an error.
 
-### 10.2 Event table
+### 10.2 Translation state
 
-`response.created` is mandatory and first. Items must finish sequentially by `output_index`; any new item/delta while another item is unfinished is rejected.
+The translator emits one `message_start`, ordered content block events, one terminal `message_delta`, and one `message_stop` on success.
 
-| Responses event | Required action |
-|---|---|
-| `response.created` | Validate response id/model/status; emit `message_start` with empty content and zero usage |
-| `response.in_progress` | Validate same response identity; emit nothing |
-| `response.output_item.added` (`message`) | Open one provisional message item; emit nothing |
-| `response.content_part.added` (`output_text`) | Emit text `content_block_start` with empty text |
-| `response.output_text.delta` | Emit `content_block_delta` with `text_delta`; append reconstructed UTF-8 text up to `STREAM_TEXT_MAX_BYTES` |
-| `response.output_text.done` | Validate reconstructed text; emit nothing |
-| `response.content_part.done` | Validate part and emit `content_block_stop` |
-| `response.output_item.added` (`function_call`) | Open provisional call, allocate tool id, emit `tool_use` `content_block_start` with empty input |
-| `response.function_call_arguments.delta` | Emit `input_json_delta`; append bounded argument state |
-| `response.function_call_arguments.done` | Validate reconstructed argument string; emit nothing |
-| `response.output_item.done` | Validate item closure; stage completed function-call, reasoning, or opaque items; for function call emit `content_block_stop` |
-| `response.output_item.added/done` (`reasoning`) | Emit nothing; only a completed item is staged, including `encrypted_content` when present |
-| `response.completed` | Require every item done and terminal usage; atomically publish any staged tool group; emit terminal success by §10.3 |
-| `response.incomplete` | Require every item done, reason `max_output_tokens`, usage, and no observed function call; discard any non-call stage and emit terminal success with `max_tokens`. If any function call was added or completed, emit a 502 stream error and no success terminator |
-| `response.failed`, `error` | Emit one Anthropic error and close without success terminator |
-| unknown auxiliary event | Emit a fixed-context warning and continue; enclosing item closure remains authoritative |
+- Text and refusal deltas each open an Anthropic text block and stream `text_delta` values. Responses refusal parts use the verified `response.refusal.delta` and `response.refusal.done` events; the done value and completed refusal part must exactly match accumulated deltas.
+- Chat function fragments are grouped by `tool_calls[].index`; the upstream id and name are retained and argument fragments become `input_json_delta`.
+- Responses function fragments are grouped by output index; `call_id` becomes the Anthropic tool id and argument fragments become `input_json_delta`.
+- A function block closes only after its complete arguments parse as a JSON object.
+- Usage and terminal reason come from the target's terminal chunk or event when supplied; missing optional usage is represented as zero rather than inferred. Responses terminal usage applies the same inclusive-total cache decomposition as non-streaming output.
+- Responses reasoning and opaque items emit no Anthropic content and are not retained.
 
-Duplicate translated-state events, delta-before-add, conflicting `output_index`, missing or non-string ids, multiple open content parts, done-before-required-done, response model changes, text exceeding `STREAM_TEXT_MAX_BYTES`, or premature EOF are 502 protocol failures. Unknown item types, unknown content parts, auxiliary events, and SSE transport fields warn and remain invisible when `output_item.done` can still close the enclosing item. Each response snapshot event must carry a non-empty response id, but the opaque id may rotate between snapshots as observed in FR9; the Anthropic message id remains the id from `response.created`. Item `id`/`item_id` values likewise may rotate and are validated only as non-empty strings; sequential `output_index` is the cross-event correlation key. If text crosses the limit after streaming has started, emit the single Anthropic mid-stream error from §11.3 and close without a success terminator.
+The request-local state is bounded by `STREAM_TEXT_MAX_BYTES` and `TOOL_ARGUMENTS_MAX_BYTES` and is discarded at the end of the request. Conflicting indexes or ids, required deltas before a start, mismatched refusal lifecycle values, malformed final arguments, duplicate terminal state, and premature EOF are protocol failures. Unknown auxiliary events warn and continue only when all visible translated blocks can still close coherently.
 
-### 10.3 Anthropic event bytes and usage
-
-Every frame is `event: <type>\ndata: <single-line JSON>\n\n`.
-
-`response.created.response.usage` was observed as `null`, so `message_start.message.usage` is the explicit placeholder:
-
-```json
-{"input_tokens":0,"output_tokens":0}
-```
-
-The terminal `response.completed` or `response.incomplete` supplies actual cumulative usage. Emit:
-
-```json
-{
-  "type": "message_delta",
-  "delta": {"stop_reason": "end_turn | tool_use | max_tokens", "stop_sequence": null},
-  "usage": {"input_tokens": "<actual>", "output_tokens": "<actual>"}
-}
-```
-
-Then emit `message_stop`. The current Anthropic schema permits cumulative `input_tokens` and `output_tokens` in terminal `message_delta.usage`; the relay does not invent an initial input-token count. Exactly one `message_start`, one terminal `message_delta`, and one `message_stop` are emitted on success.
+Every downstream frame is `event: <type>\ndata: <single-line JSON>\n\n`. A mid-stream failure follows §11.3 and never emits a success terminator.
 
 ## 11. Errors, lifecycle, and backpressure
 
@@ -470,69 +362,27 @@ Translated streaming awaits downstream `drain` whenever `write()` returns false 
 
 Anthropic writes exactly one `event:error` frame with a local safe error and closes without `message_delta` or `message_stop`. OpenAI passthrough writes one `data:{"error":...}\n\n` frame and closes without `[DONE]`. No path writes after socket closure or after a terminal success.
 
-## 12. FR9 compatibility record
+## 12. Compatibility evidence
 
-Observed live on 2026-08-24 with the selected subscription. This record is evidence, not runtime configuration.
+Live Responses probes on 2026-08-24 established the behavior needed by the best-effort baseline:
 
-### 12.1 Model metadata
+- Responses-only models advertised exact `['/responses','ws:/responses']` endpoint values.
+- Buffered and streaming text succeeded with `store:false` and no `previous_response_id`.
+- Flat function definitions, function calls, argument deltas, and a following explicit `function_call_output` succeeded.
+- Replaying a completed function-call item and its output succeeded without relay or upstream conversation storage.
+- Terminal events supplied usage; initial stream usage could be null.
+- Stream output and function calls were correlated by output index; opaque response and item ids were not stable across snapshots.
+- Reasoning with `encrypted_content` was observed, but its universal necessity was not established. The stateless baseline intentionally omits it and accepts a visible upstream rejection when a model requires it.
+- Calling `/responses` for a model advertising only `/chat/completions` returned HTTP 400 with `error.code:'unsupported_api_for_model'`; an undeclared `/v1/messages` call returned an ambiguous 400 without a machine code. Only the first exact status/code pair permits capability re-planning.
 
-`gpt-5.6-luna` and `gpt-5.6-sol` advertised exact endpoints `['/responses','ws:/responses']`. Relevant metadata included:
-
-- `supports.streaming`, `tool_calls`, `parallel_tool_calls`, and `vision`: `true`;
-- `limits.max_output_tokens`: `128000`;
-- `limits.vision.max_prompt_image_size`: `3145728`;
-- `limits.vision.max_prompt_images`: `1`;
-- supported image media types included JPEG, PNG, WebP, and GIF.
-- `gpt-5.6-sol` advertised `supports.reasoning_effort` as `['none','low','medium','high','xhigh','max']`.
-
-### 12.2 Accepted behavior
-
-- Non-streaming and streaming text succeeded with `store:false`.
-- On `gpt-5.6-sol`, non-streaming and streaming requests with `reasoning:{effort:'medium'}` succeeded. The non-streaming output contained `reasoning` followed by `message`; the stream used the already-supported `response.output_item.added/done` reasoning events and introduced no reasoning-summary delta event.
-- `instructions` and assistant `output_text` history succeeded.
-- Explicit default sampling `temperature:1` and `top_p:0.98` succeeded; tested non-default values were rejected.
-- `max_output_tokens:15` was rejected; `16` was accepted and could return incomplete with reason `max_output_tokens`.
-- Function choice, `none`, parallel calls, argument deltas, and stateless tool continuation succeeded.
-- Copilot tool definitions used the flat Responses `{type:'function', name, description?, parameters}` shape. Live probes on `gpt-5.4` and `gpt-5.6-luna` accepted this shape and rejected the same definition without `type`.
-- Continuation succeeded by replaying completed function-call items plus `function_call_output`, with no `previous_response_id` and no storage.
-- A completed reasoning item with `encrypted_content` was observed nondeterministically under high reasoning. Full replay succeeded. Its universal necessity was not established; the relay preserves and replays it whenever observed.
-- Multiple function-call items were observed completing sequentially by output index, not interleaving.
-- A real PNG base64 data URL succeeded. External URL images returned `400 invalid_request_body` with a safe diagnostic that external image URLs are unsupported.
-- Streaming `response.created.response.usage` was `null`; terminal `response.completed.response.usage` contained actual input, output, and total tokens.
-- Opaque response ids differed across `response.created`, `response.in_progress`, and `response.completed` snapshots in a live stream; model identity remained stable. The relay therefore retains the created id for Anthropic output and validates later ids only as non-empty strings.
-- Opaque item ids also differed between added, delta, and done events for one output item; sequential `output_index` remained stable. The relay correlates stream item state by output index and treats each opaque item id as independently validated metadata.
-- Claude Code 2.1.39 removed top-level `dangerouslyDisableSandbox:false` and `run_in_background:false` from a Bash `tool_use` when echoing the executed call into the next Messages request. The emitted id, name, and remaining input were unchanged. Continuation validation therefore permits only omission of authoritative top-level `false` fields and still replays the stored completed item.
-- The official Claude Code VS Code extension 2.1.233 bundled runtime sent `output_config:{effort:'medium'}` when configured with `effortLevel:'medium'`; it did not send a top-level `thinking` field in that probe. It also sent a `messages` entry with `role:'system'` containing one text block with the exact ephemeral cache hint. A live Responses probe preserving user-then-system input order and mapping both blocks to `input_text` completed with HTTP 200.
-- In a 2.1.234 streamed Glob tool loop, the continuation request inserted an additional `role:'system'` message whose content was a non-empty 49-character string while retaining the original system text-block message later in history. The relay treats the string as opaque text, maps it in place to system `input_text`, and never logs its value.
-
-Observed text stream order:
-
-```text
-response.created
-response.in_progress
-response.output_item.added(message)
-response.content_part.added(output_text)
-response.output_text.delta...
-response.output_text.done
-response.content_part.done
-response.output_item.done(message)
-response.completed
-```
-
-Observed tool stream order replaces the content-part/text events with `response.function_call_arguments.delta...`, `response.function_call_arguments.done`, and completed `response.output_item.done(function_call)` events. Completed item events, not added events, are authoritative continuation data.
-
-### 12.3 Endpoint rejection signal
-
-- Calling `/responses` with a model advertising only `/chat/completions` returned HTTP 400 with `error.code:'unsupported_api_for_model'`.
-- Calling undeclared `/v1/messages` for the Responses-only model returned an ambiguous 400 without a machine code.
-
-Therefore only the first exact status/code pair is replay-safe in v0.2.
+An authenticated Chat translation probe covering text and one complete tool round trip is required before release. No broader model or optional-feature matrix is required unless observed behavior differs.
 
 ## 13. Internal module contracts
 
 ```typescript
 type MessagesRoutePlan =
   | { kind: 'messages-passthrough'; modelId: string }
+  | { kind: 'chat-translation'; modelId: string; model: ModelRecord }
   | { kind: 'responses-translation'; modelId: string; model: ModelRecord }
   | { kind: 'client-error'; error: SafeFailure }
   | { kind: 'upstream-metadata-error'; error: SafeFailure };
@@ -546,33 +396,18 @@ interface CopilotTransport {
   invoke(plan: InvocationPlan, signal: AbortSignal): Promise<Response>;
   proxyModels(signal: AbortSignal): Promise<Response>;
 }
-
-interface ContinuationRegistry {
-  createStage(modelId: string): ContinuationStage;
-  resolve(toolUseIds: readonly string[], modelId: string): ContinuationGroup;
-  publish(stage: ContinuationStage): ContinuationGroup;
-  discard(stage: ContinuationStage): void;
-}
-
-function mapMessagesRequest(input: unknown, context: MappingContext): MappedRequest;
-function mapResponsesResult(input: unknown, context: MappingContext): MappedMessage;
 ```
 
-`SseTranslator` is request-local and exposes `push(chunk)`, `finish()`, and `abort()`; translated events are delivered through an async writer that resolves only after downstream acceptance/drain. Mapper functions are pure except for explicit continuation stage/lookup operations supplied through `MappingContext`.
+Each target owns direct request, buffered-output, and streaming-output mappers. The streaming translator is request-local and exposes `push(chunk)`, `finish()`, and `abort()`; translated events are delivered through an async writer that resolves only after downstream acceptance/drain. Mapper functions have no persistence or cross-request lookup dependency.
 
 The implementation files and ownership boundaries are those listed in `design.md` §2. Public signatures may be refined during implementation only when this section is updated in the same change.
 
 ## 14. Required tests
 
-- Table tests cover every row and rejection in §7.
-- HTTP boundary tests cover content type/encoding, declared and chunked body overflow, malformed UTF-8/JSON, non-object JSON, request read errors, and disconnect without a write attempt.
-- Catalog tests cover schema/size/count bounds, negative results, stale use, generations, shared waiters, independent cancellation, deadline, and last-waiter races.
-- Auth tests cover the classification table, proactive/reactive refresh, generation-safe commit, and safe persistence.
-- Attempt tests cover both retry orders, repeated reasons, ambiguous failures, no retry after output, and the three-invocation ceiling.
-- Continuation tests cover authoritative done items, reasoning preservation, atomic publication, oversized-group failure, deterministic count/byte eviction, immutable repeated lookup, multiple ordered history groups, complete parallel groups, expiry, mismatch, restart loss, and discard paths.
-- Output tests reject non-streaming and streaming incomplete responses that contain any function call, and admit text-only `max_output_tokens` completion.
-- SSE tests partition fixture bytes at every boundary, combine frames, split UTF-8 code points, enforce every transition in §10, reject interleaving and cumulative text overflow, verify backpressure, and assert exact terminal usage frames.
-- Route tests prove external models passthrough isolation and successful native body/stream byte preservation.
-- Native Responses route tests prove exact dispatch without catalog access, request/query and successful JSON/SSE byte preservation, safe non-2xx rewriting with no 400 retry, and no Messages translation or continuation access.
-- Security tests inject sentinel credentials into every failure surface and assert that no complete credential or substring appears.
-- SDK end-to-end tests verify translated non-streaming, streaming, tool continuation, max-token completion, and mid-stream errors with `@anthropic-ai/sdk`.
+- Route tests cover native, Chat, Responses, unsupported, and malformed-metadata outcomes with exact model preservation.
+- Each translated target has one representative request/response fixture and one complete tool-call and tool-result round trip proving exact id preservation.
+- One streaming fixture splits an SSE frame and function arguments across transport chunks and covers one mid-stream failure.
+- Representative malformed required ids and arguments fail before a misleading success can be produced.
+- Existing HTTP boundary, auth, catalog, transport, native-route, lifecycle, and security tests remain authoritative where this migration does not change their behavior.
+- Continuation registry and store tests are deleted with their implementation; no replacement persistence suite is required.
+- Add tests only for a distinct public contract, an observed upstream variant, or a reproduced regression. Do not test private helper structure or build field-permutation matrices.

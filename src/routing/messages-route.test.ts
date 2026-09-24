@@ -10,6 +10,12 @@ test('messages route uses exact endpoint priority without treating websocket as 
   };
   assert.equal(planMessagesRoute('same-model', native).kind, 'messages-passthrough');
 
+  const chat: ModelRecord = {
+    id: 'same-model',
+    supported_endpoints: ['/responses', '/chat/completions'],
+  };
+  assert.equal(planMessagesRoute('same-model', chat).kind, 'chat-translation');
+
   const responses: ModelRecord = {
     id: 'same-model',
     supported_endpoints: ['ws:/responses', '/responses'],

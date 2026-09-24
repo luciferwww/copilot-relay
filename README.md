@@ -2,10 +2,9 @@
 
 Local HTTP proxy that exposes **OpenAI-compatible** and **Anthropic-compatible** APIs, backed by GitHub Copilot. Lets tools like Claude Code, Codex CLI, etc. reuse your Copilot subscription.
 
-> Status: v0.2. Claude Code can use Copilot models that expose either native
-> Anthropic Messages or HTTP OpenAI Responses. OpenAI Responses clients can use
-> native `/v1/responses` passthrough. Codex CLI is supported through that native
-> Responses path and can be configured automatically.
+> Status: Anthropic Messages routing is stateless: native Messages is preferred,
+> followed by Chat Completions translation and best-effort Responses translation.
+> Native `/v1/responses` passthrough and Codex CLI support remain unchanged.
 
 Protocol translation follows the [protocol compatibility principle](docs/protocol-compatibility-principle.md): map verified equivalents, pass through what the target can carry, warn and omit optional unsupported extensions, and reject only when a trustworthy target exchange cannot be constructed.
 
@@ -55,9 +54,9 @@ copilot-relay configure claude          # writes ~/.claude/settings.json
 ```
 
 Fire up `claude` and it will route through the proxy to your Copilot
-subscription. For each exact requested model, the relay reads the live Copilot
-model catalog, prefers native `/v1/messages`, and otherwise uses the implemented
-HTTP `/responses` translation path. It never substitutes a different model.
+subscription. For the exact requested model, the relay prefers native
+`/v1/messages`, then stateless `/chat/completions` translation, then stateless
+best-effort `/responses` translation. It never substitutes a different model.
 
 For Codex CLI, choose a model whose live Copilot catalog entry exposes
 `/responses`:
@@ -132,7 +131,7 @@ npm unlink -g copilot-relay   # remove the global command when you're done
 |---|---|
 | `POST /v1/chat/completions` | OpenAI chat completions (streams supported) |
 | `POST /v1/responses` | Native OpenAI Responses thin passthrough (streams supported) |
-| `POST /v1/messages` | Capability-routed native Messages or Responses translation |
+| `POST /v1/messages` | Capability-routed native Messages, stateless Chat translation, or best-effort Responses translation |
 | `GET  /v1/models` | Passthrough to upstream Copilot models list |
 | `GET  /health` | Liveness probe |
 

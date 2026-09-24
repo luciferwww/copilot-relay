@@ -1,17 +1,13 @@
-import type {
-  ContinuationStage,
-  MappingContext,
-  ResponsesFunctionCallItem,
-  ResponsesOpaqueItem,
-  ResponsesReasoningItem,
-} from './types.js';
+import type { ModelRecord } from '../../models/ModelCatalog.js';
 import { logger } from '../../logger.js';
+import { matchesRequestedModel } from '../shared.js';
 import {
   SSE_FRAME_MAX_BYTES,
   STREAM_TEXT_MAX_BYTES,
   TOOL_ARGUMENTS_MAX_BYTES,
   TranslationError,
 } from './types.js';
+import { mapResponsesUsage } from '../token-usage.js';
 
 export type SseWriter = (frame: string) => Promise<void>;
 
@@ -26,21 +22,22 @@ interface ActiveItem {
   callId?: string;
   text: string;
   partText: string;
+  partType?: 'output_text' | 'refusal';
   arguments: string;
   partOpen: boolean;
   ignoredPartOpen: boolean;
-  sawTextPart: boolean;
-  textDone: boolean;
+  sawVisiblePart: boolean;
+  partDone: boolean;
   argumentsDone: boolean;
 }
 
 /** Incrementally translates a strict Responses SSE stream into Anthropic SSE frames. */
 export class SseTranslator {
-  private readonly context: MappingContext;
+  private readonly context: { readonly model: ModelRecord };
   private readonly writer: SseWriter;
   private readonly decoder = new TextDecoder('utf-8', { fatal: true });
-  private readonly stage: ContinuationStage;
   private readonly itemIds = new Set<string>();
+  private readonly callIds = new Set<string>();
   private pending = '';
   private responseId?: string;
   private active?: ActiveItem;
@@ -50,12 +47,11 @@ export class SseTranslator {
   private terminal = false;
   private aborted = false;
   private hasFunctionCall = false;
-  private published = false;
+  private hasRefusal = false;
 
-  constructor(context: MappingContext, writer: SseWriter) {
+  constructor(context: { readonly model: ModelRecord }, writer: SseWriter) {
     this.context = context;
     this.writer = writer;
-    this.stage = context.registry.createStage(context.model.id);
   }
 
   async push(chunk: Uint8Array): Promise<void> {
@@ -87,7 +83,6 @@ export class SseTranslator {
   abort(): void {
     if (this.aborted) return;
     this.aborted = true;
-    if (!this.published) this.context.registry.discard(this.stage);
   }
 
   private async consumeFrames(): Promise<void> {
@@ -153,10 +148,16 @@ export class SseTranslator {
         await this.onContentPartAdded(event);
         return;
       case 'response.output_text.delta':
-        await this.onTextDelta(event);
+        await this.onContentDelta(event, 'output_text');
         return;
       case 'response.output_text.done':
-        this.onTextDone(event);
+        this.onContentDone(event, 'output_text');
+        return;
+      case 'response.refusal.delta':
+        await this.onContentDelta(event, 'refusal');
+        return;
+      case 'response.refusal.done':
+        this.onContentDone(event, 'refusal');
         return;
       case 'response.content_part.done':
         await this.onContentPartDone(event);
@@ -227,21 +228,22 @@ export class SseTranslator {
       arguments: '',
       partOpen: false,
       ignoredPartOpen: false,
-      sawTextPart: false,
-      textDone: false,
+      sawVisiblePart: false,
+      partDone: false,
       argumentsDone: false,
     };
     if (type === 'function_call') {
       const name = requireNonEmptyString(item.name, 'function name');
       const callId = requireNonEmptyString(item.call_id, 'function call id');
-      const toolId = this.context.registry.allocateToolId(this.stage);
+      if (this.callIds.has(callId)) protocol('Responses function call id was duplicated.');
+      this.callIds.add(callId);
       const blockIndex = this.nextBlockIndex++;
-      Object.assign(this.active, { name, callId, toolId, blockIndex });
+      Object.assign(this.active, { name, callId, toolId: callId, blockIndex });
       this.hasFunctionCall = true;
       await this.emit('content_block_start', {
         type: 'content_block_start',
         index: blockIndex,
-        content_block: { type: 'tool_use', id: toolId, name, input: {} },
+        content_block: { type: 'tool_use', id: callId, name, input: {} },
       });
     }
   }
@@ -252,20 +254,27 @@ export class SseTranslator {
       protocol('Response message has multiple open content parts.');
     }
     const part = requireRecord(event.part, 'content part');
-    if (part.type !== 'output_text') {
+    if (part.type !== 'output_text' && part.type !== 'refusal') {
       active.ignoredPartOpen = true;
       logger.translationComponentIgnored({ context: 'response-content' });
       return;
     }
-    if (part.text !== undefined && part.text !== '') {
-      protocol('Response text content part is invalid.');
+    const partType = part.type;
+    const initialText = partType === 'output_text' ? part.text : part.refusal;
+    if (
+      (partType === 'output_text' && initialText !== undefined && initialText !== '') ||
+      (partType === 'refusal' && initialText !== '')
+    ) {
+      protocol('Response visible content part is invalid.');
     }
     const blockIndex = this.nextBlockIndex++;
     active.blockIndex = blockIndex;
+    active.partType = partType;
     active.partOpen = true;
-    active.sawTextPart = true;
+    active.sawVisiblePart = true;
     active.partText = '';
-    active.textDone = false;
+    active.partDone = false;
+    if (partType === 'refusal') this.hasRefusal = true;
     await this.emit('content_block_start', {
       type: 'content_block_start',
       index: blockIndex,
@@ -273,12 +282,20 @@ export class SseTranslator {
     });
   }
 
-  private async onTextDelta(event: Record<string, unknown>): Promise<void> {
+  private async onContentDelta(
+    event: Record<string, unknown>,
+    partType: 'output_text' | 'refusal',
+  ): Promise<void> {
     const active = this.requireActive(event, 'message');
-    if (!active.partOpen || active.textDone || active.blockIndex === undefined) {
-      protocol('Response text delta arrived outside an open content part.');
+    if (
+      !active.partOpen ||
+      active.partDone ||
+      active.partType !== partType ||
+      active.blockIndex === undefined
+    ) {
+      protocol('Response content delta arrived outside its open content part.');
     }
-    const delta = requireString(event.delta, 'text delta');
+    const delta = requireString(event.delta, 'content delta');
     if (Buffer.byteLength(active.text + delta, 'utf8') > STREAM_TEXT_MAX_BYTES) {
       protocol('Response text exceeds its size limit.');
     }
@@ -291,13 +308,21 @@ export class SseTranslator {
     });
   }
 
-  private onTextDone(event: Record<string, unknown>): void {
+  private onContentDone(
+    event: Record<string, unknown>,
+    partType: 'output_text' | 'refusal',
+  ): void {
     const active = this.requireActive(event, 'message');
-    if (!active.partOpen || active.textDone) protocol('Response text completion is out of order.');
-    if (requireString(event.text, 'completed text') !== active.partText) {
-      protocol('Completed response text does not match its deltas.');
+    if (!active.partOpen || active.partDone || active.partType !== partType) {
+      protocol('Response content completion is out of order.');
     }
-    active.textDone = true;
+    const completedText = partType === 'output_text'
+      ? requireString(event.text, 'completed text')
+      : requireString(event.refusal, 'completed refusal');
+    if (completedText !== active.partText) {
+      protocol('Completed response content does not match its deltas.');
+    }
+    active.partDone = true;
   }
 
   private async onContentPartDone(event: Record<string, unknown>): Promise<void> {
@@ -306,14 +331,16 @@ export class SseTranslator {
       active.ignoredPartOpen = false;
       return;
     }
-    if (!active.partOpen || !active.textDone || active.blockIndex === undefined) {
+    if (!active.partOpen || !active.partDone || !active.partType || active.blockIndex === undefined) {
       protocol('Response content part completed out of order.');
     }
     const part = requireRecord(event.part, 'completed content part');
-    if (part.type !== 'output_text' || part.text !== active.partText) {
+    const completedText = active.partType === 'output_text' ? part.text : part.refusal;
+    if (part.type !== active.partType || completedText !== active.partText) {
       protocol('Completed response content part does not match its deltas.');
     }
     active.partOpen = false;
+    active.partType = undefined;
     await this.emit('content_block_stop', {
       type: 'content_block_stop',
       index: active.blockIndex,
@@ -361,7 +388,7 @@ export class SseTranslator {
       if (
         active.partOpen ||
         active.ignoredPartOpen ||
-        (active.sawTextPart && !active.textDone)
+        (active.sawVisiblePart && !active.partDone)
       ) {
         protocol('Message item completed before its content.');
       }
@@ -371,11 +398,15 @@ export class SseTranslator {
       const completedText = item.content
         .map((partValue) => {
           const part = requireRecord(partValue, 'completed message content');
-          if (part.type !== 'output_text') {
-            logger.translationComponentIgnored({ context: 'response-content' });
-            return '';
+          if (part.type === 'output_text') {
+            return requireString(part.text, 'completed message text');
           }
-          return requireString(part.text, 'completed message text');
+          if (part.type === 'refusal') {
+            this.hasRefusal = true;
+            return requireString(part.refusal, 'completed message refusal');
+          }
+          logger.translationComponentIgnored({ context: 'response-content' });
+          return '';
         })
         .join('');
       if (completedText !== active.text) protocol('Completed message item does not match its deltas.');
@@ -386,18 +417,7 @@ export class SseTranslator {
       if (item.call_id !== active.callId || item.name !== active.name || item.arguments !== active.arguments) {
         protocol('Completed function call does not match its deltas.');
       }
-      const parsed = parseArguments(active.arguments);
-      const authoritative = item as unknown as ResponsesFunctionCallItem;
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: authoritative,
-      });
-      this.context.registry.addCall(this.stage, active.toolId, {
-        callId: active.callId as string,
-        outputIndex: active.outputIndex,
-        name: active.name as string,
-        input: parsed,
-      });
+      parseArguments(active.arguments);
       await this.emit('content_block_stop', {
         type: 'content_block_stop',
         index: active.blockIndex,
@@ -406,15 +426,6 @@ export class SseTranslator {
       if (item.status !== undefined && item.status !== 'completed') {
         protocol('Reasoning item is incomplete.');
       }
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: item as unknown as ResponsesReasoningItem,
-      });
-    } else {
-      this.context.registry.addItem(this.stage, {
-        outputIndex: active.outputIndex,
-        item: item as unknown as ResponsesOpaqueItem,
-      });
     }
     this.active = undefined;
     this.nextOutputIndex += 1;
@@ -423,9 +434,7 @@ export class SseTranslator {
   private async onTerminal(event: Record<string, unknown>, incomplete: boolean): Promise<void> {
     if (this.active) protocol('Response terminated before every output item completed.');
     const response = this.validateResponseIdentity(event.response);
-    const usage = requireRecord(response.usage, 'terminal usage');
-    const inputTokens = requireTokenCount(usage.input_tokens, 'input_tokens');
-    const outputTokens = requireTokenCount(usage.output_tokens, 'output_tokens');
+    const usage = mapResponsesUsage(response.usage);
     if (incomplete) {
       const details = requireRecord(response.incomplete_details, 'incomplete details');
       if (
@@ -435,20 +444,20 @@ export class SseTranslator {
       ) {
         protocol('Incomplete response cannot complete this stream.');
       }
-      this.context.registry.discard(this.stage);
     } else if (response.status !== 'completed') {
       protocol('Completed response status is invalid.');
-    } else if (this.hasFunctionCall) {
-      this.context.registry.publish(this.stage);
-      this.published = true;
-    } else {
-      this.context.registry.discard(this.stage);
     }
-    const stopReason = incomplete ? 'max_tokens' : this.hasFunctionCall ? 'tool_use' : 'end_turn';
+    const stopReason = incomplete
+      ? 'max_tokens'
+      : this.hasFunctionCall
+        ? 'tool_use'
+        : this.hasRefusal
+          ? 'refusal'
+          : 'end_turn';
     await this.emit('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      usage,
     });
     await this.emit('message_stop', { type: 'message_stop' });
     this.terminal = true;
@@ -457,7 +466,9 @@ export class SseTranslator {
   private validateResponseIdentity(value: unknown, initialize = false): Record<string, unknown> {
     const response = requireRecord(value, 'response');
     const id = requireNonEmptyString(response.id, 'response id');
-    if (response.model !== this.context.model.id) protocol('Response model does not match the request.');
+    if (!matchesRequestedModel(response.model, this.context.model.id)) {
+      protocol('Response model does not match the request.');
+    }
     if (initialize) this.responseId = id;
     return response;
   }
@@ -501,13 +512,6 @@ function parseArguments(value: string): Record<string, unknown> {
   }
   if (!isRecord(parsed)) protocol('Function arguments must be a JSON object.');
   return parsed;
-}
-
-function requireTokenCount(value: unknown, label: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    protocol(`Response usage ${label} is invalid.`);
-  }
-  return value;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

@@ -6,6 +6,7 @@ export type RequestRoute =
   | 'chat-passthrough'
   | 'responses-passthrough'
   | 'messages-passthrough'
+  | 'chat-translation'
   | 'responses-translation'
   | 'not-found';
 export type RequestEndpoint = '/models' | '/chat/completions' | '/v1/messages' | '/responses';
@@ -72,16 +73,6 @@ export interface RequestTerminalLog extends RequestLogBase {
   readonly invocationCount: number;
   readonly authRetryUsed: boolean;
   readonly replanUsed: boolean;
-}
-
-export interface ContinuationCapacityEvictionLog {
-  readonly trigger: 'group-count' | 'aggregate-bytes' | 'group-count-and-aggregate-bytes';
-  readonly evictedGroupCount: number;
-  readonly groupCountBefore: number;
-  readonly groupCountAfter: number;
-  readonly totalBytesBefore: number;
-  readonly totalBytesAfter: number;
-  readonly oldestEvictedIdleAgeMs: number;
 }
 
 export interface TranslationFieldsIgnoredLog {
@@ -165,6 +156,4 @@ export const logger = {
     logEvent('warn', 'translation.component_ignored', fields),
   translationPassthrough: (fields: TranslationPassthroughLog) =>
     logEvent('warn', 'translation.passthrough', fields),
-  continuationCapacityEvicted: (fields: ContinuationCapacityEvictionLog) =>
-    logEvent('warn', 'continuation.capacity_evicted', fields),
 };

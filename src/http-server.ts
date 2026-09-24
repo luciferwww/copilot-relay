@@ -1,22 +1,22 @@
 import http from 'node:http';
-import { CONTINUATION_DIR, type AppConfig } from './config.js';
+import type { AppConfig } from './config.js';
 import { isLoopbackHost, requireRemoteAccessOptIn } from './bind-policy.js';
 import { AuthManager, AuthManagerError } from './auth/AuthManager.js';
 import { ModelCatalog, ModelCatalogError } from './models/ModelCatalog.js';
 import { planMessagesRoute, type MessagesRoutePlan } from './routing/messages-route.js';
 import { CopilotTransport, type InvocationContext, type InvocationPlan } from './upstream/CopilotTransport.js';
-import { ContinuationRegistry } from './translate/responses/ContinuationRegistry.js';
-import { ContinuationStore } from './translate/responses/ContinuationStore.js';
-import { mapMessagesRequest } from './translate/responses/request-mapper.js';
+import { mapMessagesRequest as mapMessagesToChat } from './translate/chat/request-mapper.js';
+import { mapChatResult } from './translate/chat/response-mapper.js';
+import { SseTranslator as ChatSseTranslator } from './translate/chat/SseTranslator.js';
+import { mapMessagesRequest as mapMessagesToResponses } from './translate/responses/request-mapper.js';
 import { mapResponsesResult } from './translate/responses/response-mapper.js';
-import { SseTranslator } from './translate/responses/SseTranslator.js';
+import { SseTranslator as ResponsesSseTranslator } from './translate/responses/SseTranslator.js';
 import {
   ERROR_BODY_MAX_BYTES,
   NON_STREAM_RESPONSE_MAX_BYTES,
   REQUEST_BODY_MAX_BYTES,
   TranslationError,
   type MappedRequest,
-  type MappingContext,
   type SafeFailure,
 } from './translate/responses/types.js';
 import {
@@ -40,7 +40,6 @@ export interface HttpServerHandle {
 export interface HttpRuntime {
   readonly transport: CopilotTransport;
   readonly catalog: ModelCatalog;
-  readonly registry: ContinuationRegistry;
   close?(): void;
 }
 
@@ -313,13 +312,19 @@ async function handleMessages(
   while (true) {
     if (plan.kind === 'client-error' || plan.kind === 'upstream-metadata-error') throw plan.error;
     trace.route = plan.kind;
-    trace.endpoint = plan.kind === 'messages-passthrough' ? '/v1/messages' : '/responses';
+    trace.endpoint = plan.kind === 'messages-passthrough'
+      ? '/v1/messages'
+      : plan.kind === 'chat-translation'
+        ? '/chat/completions'
+        : '/responses';
     logPlannedRequest(trace, invocation.replanUsed);
     trace.phase = 'mapping';
-    const mappingContext: MappingContext = { model, registry: runtime.registry };
-    mapped = plan.kind === 'responses-translation'
-      ? mapMessagesRequest(body.value, mappingContext)
-      : undefined;
+    const mappingContext = { model };
+    mapped = plan.kind === 'chat-translation'
+      ? mapMessagesToChat(body.value, mappingContext)
+      : plan.kind === 'responses-translation'
+        ? mapMessagesToResponses(body.value, mappingContext)
+        : undefined;
     trace.invocation = invocation;
     trace.phase = 'upstream';
     response = await runtime.transport.invoke(
@@ -354,10 +359,22 @@ async function handleMessages(
     await pipePassthrough(response, res, 'anthropic', signal);
     return;
   }
-  if (!mapped) throw new Error('Responses mapping was not initialized.');
-  const mappingContext: MappingContext = { model, registry: runtime.registry };
-  if (mapped.stream) await translateStream(response, res, mappingContext, signal);
-  else await translateNonStream(response, res, mappingContext);
+  if (!mapped) throw new Error('Messages translation was not initialized.');
+  const mappingContext = { model };
+  if (mapped.stream) {
+    const translator = plan.kind === 'chat-translation'
+      ? new ChatSseTranslator(mappingContext, async (frame) => {
+        if (!res.write(frame)) await waitForDrain(res, signal);
+      })
+      : new ResponsesSseTranslator(mappingContext, async (frame) => {
+        if (!res.write(frame)) await waitForDrain(res, signal);
+      });
+    await translateStream(response, res, translator);
+  } else {
+    await translateNonStream(response, res, (value) => plan.kind === 'chat-translation'
+      ? mapChatResult(value, mappingContext).message
+      : mapResponsesResult(value, mappingContext).message);
+  }
 }
 
 function createMessagesInvocation(
@@ -382,9 +399,9 @@ function createMessagesInvocation(
       headers,
     };
   }
-  if (!mapped) throw new Error('Responses mapping was not initialized.');
+  if (!mapped) throw new Error('Messages translation was not initialized.');
   return {
-    endpoint: '/responses',
+    endpoint: plan.kind === 'chat-translation' ? '/chat/completions' : '/responses',
     body: Buffer.from(JSON.stringify(mapped.body), 'utf8'),
     accept: mapped.stream ? 'text/event-stream' : 'application/json',
     headers: { 'Openai-Intent': 'conversation-panel' },
@@ -394,7 +411,7 @@ function createMessagesInvocation(
 async function translateNonStream(
   response: Response,
   res: http.ServerResponse,
-  context: MappingContext,
+  mapResult: (value: unknown) => Readonly<Record<string, unknown>>,
 ): Promise<void> {
   const body = await readBoundedResponse(response, NON_STREAM_RESPONSE_MAX_BYTES);
   let value: unknown;
@@ -404,29 +421,28 @@ async function translateNonStream(
     throw new TranslationError({
       status: 502,
       type: 'api_error',
-      message: 'Responses endpoint returned invalid JSON.',
+      message: 'Translated upstream endpoint returned invalid JSON.',
     });
   }
-  const mapped = mapResponsesResult(value, context);
-  if (mapped.stage) context.registry.publish(mapped.stage);
+  const mapped = mapResult(value);
   res.statusCode = 200;
   res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify(mapped.message));
+  res.end(JSON.stringify(mapped));
 }
 
 async function translateStream(
   response: Response,
   res: http.ServerResponse,
-  context: MappingContext,
-  signal: AbortSignal,
+  translator: {
+    push(chunk: Uint8Array): Promise<void>;
+    finish(): Promise<void>;
+    abort(): void;
+  },
 ): Promise<void> {
-  if (!response.body) throw new Error('Responses stream body is missing.');
+  if (!response.body) throw new Error('Translated stream body is missing.');
   res.statusCode = 200;
   res.setHeader('content-type', 'text/event-stream');
   res.setHeader('cache-control', 'no-cache');
-  const translator = new SseTranslator(context, async (frame) => {
-    if (!res.write(frame)) await waitForDrain(res, signal);
-  });
   const reader = response.body.getReader();
   try {
     while (true) {
@@ -877,18 +893,8 @@ function isRequestDiagnosticCode(value: string | undefined): value is RequestDia
 function createRuntime(cfg: AppConfig): HttpRuntime {
   const auth = new AuthManager(cfg);
   const transport = new CopilotTransport(cfg, auth);
-  const store = new ContinuationStore(CONTINUATION_DIR);
-  let registry: ContinuationRegistry;
-  try {
-    registry = new ContinuationRegistry({ store });
-  } catch (error) {
-    store.close();
-    throw error;
-  }
   return {
     transport,
     catalog: new ModelCatalog(transport),
-    registry,
-    close: () => registry.close(),
   };
 }

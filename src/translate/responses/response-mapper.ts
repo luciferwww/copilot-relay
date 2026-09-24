@@ -1,23 +1,22 @@
-import type {
-  ContinuationStage,
-  MappedMessage,
-  MappingContext,
-  ResponsesFunctionCallItem,
-  ResponsesOpaqueItem,
-  ResponsesReasoningItem,
-} from './types.js';
+import type { ModelRecord } from '../../models/ModelCatalog.js';
+import type { MappedMessage } from './types.js';
 import { logger } from '../../logger.js';
+import { matchesRequestedModel } from '../shared.js';
 import { TranslationError } from './types.js';
+import { mapResponsesUsage } from '../token-usage.js';
 
 /** Maps one bounded, complete Responses JSON payload into an Anthropic Message. */
-export function mapResponsesResult(input: unknown, context: MappingContext): MappedMessage {
+export function mapResponsesResult(
+  input: unknown,
+  context: { readonly model: ModelRecord },
+): MappedMessage {
   const response = requireRecord(input, 'response');
   if (typeof response.id !== 'string' || response.id.length === 0) protocol('Response id is invalid.');
-  if (response.model !== context.model.id) protocol('Response model does not match the request.');
+  if (!matchesRequestedModel(response.model, context.model.id)) {
+    protocol('Response model does not match the request.');
+  }
   if (!Array.isArray(response.output)) protocol('Response output is invalid.');
-  const usage = requireRecord(response.usage, 'usage');
-  const inputTokens = requireTokenCount(usage.input_tokens, 'input_tokens');
-  const outputTokens = requireTokenCount(usage.output_tokens, 'output_tokens');
+  const usage = mapResponsesUsage(response.usage);
   const incomplete = response.status === 'incomplete';
   if (response.status !== 'completed' && !incomplete) protocol('Response status is not supported.');
   if (incomplete) {
@@ -28,48 +27,38 @@ export function mapResponsesResult(input: unknown, context: MappingContext): Map
   }
 
   const content: Record<string, unknown>[] = [];
-  const stage = context.registry.createStage(context.model.id);
+  const callIds = new Set<string>();
   let hasFunctionCall = false;
-  try {
-    response.output.forEach((itemValue, outputIndex) => {
-      const item = requireRecord(itemValue, 'output item');
-      if (item.type === 'message') {
-        mapMessageItem(item, content);
-        return;
-      }
-      if (item.type === 'function_call') {
-        hasFunctionCall = true;
-        mapFunctionCall(item, outputIndex, content, stage, context);
-        return;
-      }
-      if (item.type === 'reasoning') {
-        const reasoning = validateReasoning(item);
-        context.registry.addItem(stage, { outputIndex, item: reasoning });
-        return;
-      }
-      logger.translationComponentIgnored({ context: 'response-output' });
-      if (
-        !incomplete &&
-        typeof item.type === 'string' &&
-        item.type.length > 0 &&
-        (item.status === undefined || item.status === 'completed')
-      ) {
-        context.registry.addItem(stage, {
-          outputIndex,
-          item: item as unknown as ResponsesOpaqueItem,
-        });
-      }
-    });
-    if (incomplete && hasFunctionCall) {
-      protocol('Incomplete response contained a function call.');
+  let hasRefusal = false;
+  response.output.forEach((itemValue) => {
+    const item = requireRecord(itemValue, 'output item');
+    if (item.type === 'message') {
+      hasRefusal = mapMessageItem(item, content) || hasRefusal;
+      return;
     }
-  } catch (error) {
-    context.registry.discard(stage);
-    throw error;
+    if (item.type === 'function_call') {
+      hasFunctionCall = true;
+      mapFunctionCall(item, content, callIds);
+      return;
+    }
+    if (item.type === 'reasoning') {
+      validateReasoning(item);
+      logger.translationComponentIgnored({ context: 'response-output' });
+      return;
+    }
+    logger.translationComponentIgnored({ context: 'response-output' });
+  });
+  if (incomplete && hasFunctionCall) {
+    protocol('Incomplete response contained a function call.');
   }
 
-  if (!hasFunctionCall) context.registry.discard(stage);
-  const stopReason = incomplete ? 'max_tokens' : hasFunctionCall ? 'tool_use' : 'end_turn';
+  const stopReason = incomplete
+    ? 'max_tokens'
+    : hasFunctionCall
+      ? 'tool_use'
+      : hasRefusal
+        ? 'refusal'
+        : 'end_turn';
   return {
     message: {
       id: response.id,
@@ -79,32 +68,38 @@ export function mapResponsesResult(input: unknown, context: MappingContext): Map
       content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      usage,
     },
-    stage: hasFunctionCall ? stage : undefined,
   };
 }
 
-function mapMessageItem(item: Record<string, unknown>, output: Record<string, unknown>[]): void {
+function mapMessageItem(item: Record<string, unknown>, output: Record<string, unknown>[]): boolean {
   if (item.status !== 'completed' || item.role !== 'assistant' || !Array.isArray(item.content)) {
     protocol('Response message item is invalid.');
   }
+  let hasRefusal = false;
   for (const partValue of item.content) {
     const part = requireRecord(partValue, 'message content');
-    if (part.type !== 'output_text' || typeof part.text !== 'string') {
-      logger.translationComponentIgnored({ context: 'response-content' });
+    if (part.type === 'output_text') {
+      if (typeof part.text !== 'string') protocol('Response text content is invalid.');
+      output.push({ type: 'text', text: part.text });
       continue;
     }
-    output.push({ type: 'text', text: part.text });
+    if (part.type === 'refusal') {
+      if (typeof part.refusal !== 'string') protocol('Response refusal content is invalid.');
+      output.push({ type: 'text', text: part.refusal });
+      hasRefusal = true;
+      continue;
+    }
+    logger.translationComponentIgnored({ context: 'response-content' });
   }
+  return hasRefusal;
 }
 
 function mapFunctionCall(
   item: Record<string, unknown>,
-  outputIndex: number,
   output: Record<string, unknown>[],
-  stage: ContinuationStage,
-  context: MappingContext,
+  callIds: Set<string>,
 ): void {
   if (
     item.status !== 'completed' ||
@@ -116,6 +111,8 @@ function mapFunctionCall(
   ) {
     protocol('Response function call is invalid.');
   }
+  if (callIds.has(item.call_id)) protocol('Response function call id is duplicated.');
+  callIds.add(item.call_id);
   let parsedArguments: unknown;
   try {
     parsedArguments = JSON.parse(item.arguments);
@@ -123,39 +120,16 @@ function mapFunctionCall(
     protocol('Response function arguments are invalid JSON.');
   }
   if (!isRecord(parsedArguments)) protocol('Response function arguments must be an object.');
-  const authoritative: ResponsesFunctionCallItem = {
-    ...(item as unknown as ResponsesFunctionCallItem),
-    type: 'function_call',
-    call_id: item.call_id,
-    name: item.name,
-    arguments: item.arguments,
-  };
-  const toolId = context.registry.allocateToolId(stage);
-  context.registry.addItem(stage, { outputIndex, item: authoritative });
-  context.registry.addCall(stage, toolId, {
-    callId: item.call_id,
-    outputIndex,
-    name: item.name,
-    input: parsedArguments,
-  });
-  output.push({ type: 'tool_use', id: toolId, name: item.name, input: parsedArguments });
+  output.push({ type: 'tool_use', id: item.call_id, name: item.name, input: parsedArguments });
 }
 
-function validateReasoning(item: Record<string, unknown>): ResponsesReasoningItem {
+function validateReasoning(item: Record<string, unknown>): void {
   if (item.status !== undefined && item.status !== 'completed') {
     protocol('Response reasoning item is incomplete.');
   }
   if (item.encrypted_content !== undefined && typeof item.encrypted_content !== 'string') {
     protocol('Response reasoning content is invalid.');
   }
-  return { ...(item as unknown as ResponsesReasoningItem), type: 'reasoning' };
-}
-
-function requireTokenCount(value: unknown, name: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    protocol(`Response usage ${name} is invalid.`);
-  }
-  return value;
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
