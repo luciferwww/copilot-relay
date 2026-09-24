@@ -25,6 +25,7 @@ import {
 import { startServer } from './server.js';
 import { mergeCodexConfig } from './codex-config.js';
 import { writeTextFileAtomically } from './atomic-file.js';
+import { describeCommandError, describeListenError } from './cli-error.js';
 
 const program = new Command();
 
@@ -118,6 +119,12 @@ program
         unlinkSync(PID_FILE);
       } catch {
         // The PID file may already have been removed by external cleanup.
+      }
+      const listenError = describeListenError(error, cfg.host, cfg.port);
+      if (listenError) {
+        logger.error(listenError);
+        process.exitCode = 1;
+        return;
       }
       throw error;
     }
@@ -292,7 +299,7 @@ configureCmd
     }
   });
 
-program.parseAsync(process.argv).catch(() => {
-  logger.error('Command failed.');
+program.parseAsync(process.argv).catch((error: unknown) => {
+  logger.error(describeCommandError(error));
   process.exit(1);
 });
