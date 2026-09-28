@@ -43,7 +43,7 @@ function parsePort(value: string): number {
 program
   .name('copilot-relay')
   .description('Local proxy exposing OpenAI/Anthropic APIs backed by GitHub Copilot.')
-  .version('0.2.0');
+  .version('1.0.0-rc.1');
 
 program
   .command('start')

@@ -12,10 +12,7 @@ Protocol translation follows the [protocol compatibility principle](docs/protoco
 
 - **Node.js ≥ 18** (native `fetch` and Web Streams are required).
 - **Git** for cloning.
-- **Microsoft-internal note**: this repo ships an [.npmrc](.npmrc) pointing at
-  `https://packagefeedproxy.microsoft.io/npm/` so `npm install` works from the
-  corporate network. External users can delete the file or replace it with a
-  registry they have access to (e.g. the public `https://registry.npmjs.org/`).
+- Access to the public npm registry or a compatible mirror.
 
 ## Install
 
@@ -38,6 +35,38 @@ directly (works from any directory):
 ```powershell
 node c:\dev\copilot-relay\dist\cli.js <subcommand>
 ```
+
+### Build a standalone executable
+
+To build a standalone executable for the current operating system and CPU
+architecture:
+
+```powershell
+npm install
+npm run build:exe
+```
+
+Executable packaging requires **Node.js 20 or newer**. Normal source builds and
+runtime use continue to support Node.js 18 or newer.
+
+The command bundles the application and its dependencies, creates a Node.js
+Single Executable Application, runs a `--help` smoke test without Node.js on
+`PATH`, and writes the executable and its SHA-256 checksum under `release/`. For
+example, a Windows x64 build produces:
+
+```text
+release/copilot-relay-windows-x64.exe
+release/copilot-relay-windows-x64.exe.sha256
+release/LICENSE.txt
+release/THIRD_PARTY_NOTICES.txt
+```
+
+The generated executable does not require Node.js, npm, the source tree, or
+`node_modules` on the destination machine. The first packaging phase builds only
+for the current platform and architecture; build each release target on its
+matching operating system. Windows builds are unsigned unless a later release
+signing step signs them, so locally built executables may trigger a SmartScreen
+warning when shared.
 
 ## First-time setup
 
@@ -149,6 +178,12 @@ Notable fields:
 
 - This code is a **from-scratch reimplementation** of the public parts of the GitHub Copilot HTTP protocol, written for personal use.
 - GitHub Copilot subscription terms apply. Do not redistribute your Copilot token.
+
+## License
+
+Licensed under the [MIT License](LICENSE). This license covers copilot-relay
+itself; it does not grant rights to GitHub Copilot, GitHub or Microsoft
+services, or their trademarks.
 
 ## Contributors
 

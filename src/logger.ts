@@ -32,6 +32,12 @@ export type RequestDiagnosticCode =
 export type MessageRole = 'user' | 'assistant' | 'system' | 'unknown';
 export type ContentKind = 'string' | 'array' | 'other';
 export type ContentBlockType = 'text' | 'tool_use' | 'tool_result' | 'image' | 'unknown';
+export type ResponseInputItemType =
+  | 'message'
+  | 'reasoning'
+  | 'function_call'
+  | 'function_call_output'
+  | 'other';
 
 export interface MessageShape {
   readonly role: MessageRole;
@@ -52,6 +58,10 @@ export interface RequestReceivedLog extends RequestLogBase {
   readonly toolCount: number;
   readonly messageCount: number;
   readonly messages: readonly MessageShape[];
+  readonly inputItemCount: number;
+  readonly inputItemTypes: readonly ResponseInputItemType[];
+  readonly hasPreviousResponseId: boolean;
+  readonly store?: boolean;
 }
 
 export interface RequestPlannedLog extends RequestLogBase {

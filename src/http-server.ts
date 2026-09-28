@@ -20,6 +20,7 @@ import {
   type SafeFailure,
 } from './translate/responses/types.js';
 import {
+  type ResponseInputItemType,
   logger,
   type ContentBlockType,
   type ContentKind,
@@ -284,8 +285,7 @@ async function handleResponses(
   );
 
   if (!response.ok) {
-    await discardErrorBody(response);
-    throw statusFailure(response.status);
+    throw await nativeResponsesFailure(response, body.value);
   }
   invocation.downstreamStarted = true;
   trace.phase = 'response';
@@ -575,6 +575,58 @@ async function discardErrorBody(response: Response): Promise<void> {
   await readBoundedResponse(response, ERROR_BODY_MAX_BYTES, false);
 }
 
+async function nativeResponsesFailure(
+  response: Response,
+  request: Record<string, unknown>,
+): Promise<SafeFailure> {
+  const body = await readBoundedResponse(response, ERROR_BODY_MAX_BYTES, false);
+  if (response.status === 400 && body) {
+    try {
+      const value = JSON.parse(body.toString('utf8')) as unknown;
+      if (
+        isRecord(value)
+        && isRecord(value.error)
+        && (
+          (
+            typeof request.previous_response_id === 'string'
+            && request.previous_response_id.length > 0
+            && value.error.code === 'unsupported_value'
+            && value.error.param === 'previous_response_id'
+          )
+          || (
+            value.error.code === 'invalid_request_body'
+            && hasOrphanFunctionCallOutput(request.input)
+          )
+        )
+      ) {
+        return {
+          status: 400,
+          type: 'invalid_request_error',
+          message: 'Previous response state is unavailable. Retry with full input history.',
+          code: 'previous_response_not_found',
+        };
+      }
+    } catch {
+      // Malformed upstream errors use the normal status-only failure below.
+    }
+  }
+  return statusFailure(response.status);
+}
+
+function hasOrphanFunctionCallOutput(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  const callIds = new Set<string>();
+  for (const itemValue of value) {
+    if (!isRecord(itemValue) || typeof itemValue.call_id !== 'string') continue;
+    if (itemValue.type === 'function_call') {
+      callIds.add(itemValue.call_id);
+    } else if (itemValue.type === 'function_call_output' && !callIds.has(itemValue.call_id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function readBoundedResponse(
   response: Response,
   limit: number,
@@ -632,13 +684,14 @@ function formatError(protocol: Protocol, failureValue: SafeFailure): Record<stri
   if (protocol === 'anthropic') {
     return { type: 'error', error: { type: failureValue.type, message: failureValue.message } };
   }
-  return {
-    error: {
-      type: failureValue.type,
-      message: failureValue.message,
-      code: failureValue.code ?? null,
-    },
+  const error = {
+    type: failureValue.type,
+    message: failureValue.message,
+    code: failureValue.code ?? null,
   };
+  return failureValue.code === 'previous_response_not_found'
+    ? { code: failureValue.code, message: failureValue.message, error }
+    : { error };
 }
 
 function toSafeFailure(error: unknown): SafeFailure {
@@ -782,6 +835,7 @@ function logReceivedRequest(trace: RequestTrace, body: Record<string, unknown>):
   const modelId = typeof body.model === 'string' ? body.model : undefined;
   if (modelId !== undefined) trace.modelId = modelId;
   const messageValues = Array.isArray(body.messages) ? body.messages : [];
+  const inputValues = Array.isArray(body.input) ? body.input : [];
   logger.requestReceived({
     requestId: trace.requestId,
     method: trace.method,
@@ -791,6 +845,10 @@ function logReceivedRequest(trace: RequestTrace, body: Record<string, unknown>):
     toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
     messageCount: messageValues.length,
     messages: messageValues.slice(0, 64).map(summarizeMessage),
+    inputItemCount: inputValues.length,
+    inputItemTypes: inputValues.slice(0, 64).map(summarizeResponseInputItem),
+    hasPreviousResponseId: typeof body.previous_response_id === 'string',
+    store: typeof body.store === 'boolean' ? body.store : undefined,
   });
 }
 
@@ -825,6 +883,16 @@ function summarizeMessage(value: unknown): MessageShape {
     blockCount: contentKind === 'string' ? 1 : blockValues.length,
     blockTypes,
   };
+}
+
+function summarizeResponseInputItem(value: unknown): ResponseInputItemType {
+  if (!isRecord(value)) return 'other';
+  return (
+    value.type === 'message'
+    || value.type === 'reasoning'
+    || value.type === 'function_call'
+    || value.type === 'function_call_output'
+  ) ? value.type : 'other';
 }
 
 function summarizeBlockType(value: unknown): ContentBlockType {
