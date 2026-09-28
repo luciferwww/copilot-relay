@@ -557,6 +557,145 @@ test('native Responses does not retry a plain upstream 400', async () => {
   }
 });
 
+test('native Responses signals an unsupported previous response for client history replay', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const upstreamSentinel = 'UPSTREAM_PREVIOUS_RESPONSE_SENTINEL';
+  let invocations = 0;
+  const runtime = runtimeFor(model, async () => {
+    invocations += 1;
+    return Response.json({
+      error: {
+        message: upstreamSentinel,
+        type: 'invalid_request_error',
+        code: 'unsupported_value',
+        param: 'previous_response_id',
+      },
+    }, { status: 400 });
+  });
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        input: 'continue',
+        previous_response_id: 'resp_previous',
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      code: 'previous_response_not_found',
+      message: 'Previous response state is unavailable. Retry with full input history.',
+      error: {
+        type: 'invalid_request_error',
+        message: 'Previous response state is unavailable. Retry with full input history.',
+        code: 'previous_response_not_found',
+      },
+    });
+    assert.equal(invocations, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test('native Responses signals orphaned tool output for client history replay', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const runtime = runtimeFor(model, async () => Response.json({
+    error: { message: 'unsafe upstream detail', code: 'invalid_request_body' },
+  }, { status: 400 }));
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        input: [
+          { type: 'function_call_output', call_id: 'call-missing', output: 'result' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      code: 'previous_response_not_found',
+      message: 'Previous response state is unavailable. Retry with full input history.',
+      error: {
+        type: 'invalid_request_error',
+        message: 'Previous response state is unavailable. Retry with full input history.',
+        code: 'previous_response_not_found',
+      },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test('native Responses does not misclassify other unsupported parameters', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const runtime = runtimeFor(model, async () => Response.json({
+    error: {
+      message: 'unsafe upstream detail',
+      type: 'invalid_request_error',
+      code: 'unsupported_value',
+      param: 'store',
+    },
+  }, { status: 400 }));
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        input: 'hello',
+        previous_response_id: 'resp_previous',
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: {
+        type: 'invalid_request_error',
+        message: 'Upstream rejected the request.',
+        code: null,
+      },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test('native Responses does not misclassify a complete tool call round trip', async () => {
+  const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
+  const runtime = runtimeFor(model, async () => Response.json({
+    error: { message: 'unsafe upstream detail', code: 'invalid_request_body' },
+  }, { status: 400 }));
+  const server = await startHttpServer(CONFIG, { runtime });
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-test',
+        input: [
+          { type: 'function_call', call_id: 'call-complete', name: 'lookup', arguments: '{}' },
+          { type: 'function_call_output', call_id: 'call-complete', output: 'result' },
+        ],
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: {
+        type: 'invalid_request_error',
+        message: 'Upstream rejected the request.',
+        code: null,
+      },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
 test('exact unsupported endpoint code refreshes and replans the same model once', async () => {
   const responsesModel: ModelRecord = {
     id: 'gpt-test',
@@ -760,6 +899,8 @@ test('HTTP lifecycle logs expose request structure without content values', asyn
 
 test('native Responses logs exclude input and upstream error content', async () => {
   const inputSentinel = 'NATIVE_RESPONSES_INPUT_SENTINEL';
+  const markerSentinel = 'NATIVE_RESPONSES_MARKER_SENTINEL';
+  const outputSentinel = 'NATIVE_RESPONSES_OUTPUT_SENTINEL';
   const upstreamSentinel = 'NATIVE_RESPONSES_UPSTREAM_SENTINEL';
   const model: ModelRecord = { id: 'gpt-test', supported_endpoints: ['/responses'] };
   const runtime = runtimeFor(model, async () => new Response(upstreamSentinel, { status: 503 }));
@@ -772,7 +913,15 @@ test('native Responses logs exclude input and upstream error content', async () 
     const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-test', input: inputSentinel }),
+      body: JSON.stringify({
+        model: 'gpt-test',
+        input: [
+          { type: 'message', role: 'user', content: inputSentinel },
+          { type: 'function_call_output', call_id: 'call-test', output: outputSentinel },
+        ],
+        previous_response_id: markerSentinel,
+        store: false,
+      }),
     });
     assert.equal(response.status, 502);
   } finally {
@@ -783,8 +932,13 @@ test('native Responses logs exclude input and upstream error content', async () 
 
   const output = lines.join('\n');
   assert.equal(output.includes(inputSentinel), false);
+  assert.equal(output.includes(markerSentinel), false);
+  assert.equal(output.includes(outputSentinel), false);
   assert.equal(output.includes(upstreamSentinel), false);
-  assert.match(output, /request\.received .*"path":"\/v1\/responses".*"modelId":"gpt-test"/);
+  assert.match(
+    output,
+    /request\.received .*"path":"\/v1\/responses".*"modelId":"gpt-test".*"inputItemCount":2.*"inputItemTypes":\["message","function_call_output"\].*"hasPreviousResponseId":true.*"store":false/,
+  );
   assert.match(output, /request\.failed .*"route":"responses-passthrough".*"endpoint":"\/responses".*"status":502/);
 });
 
